@@ -1,0 +1,126 @@
+VGG-16 Layer-wise Statistics
+===========================
+
+Layer: layer_1
+------------------------------
+MAC Efficiency: 95.88%
+Energy Consumed: 195588157219.20 pJ
+MACs Performed: 1696512
+Dense MACs Possible: 1769472
+Percentage of Total Energy: 0.00%
+Percentage of Total MACs: 0.57%
+
+Layer: layer_2
+------------------------------
+MAC Efficiency: 48.13%
+Energy Consumed: 12327018196908.00 pJ
+MACs Performed: 18170176
+Dense MACs Possible: 37748736
+Percentage of Total Energy: 0.17%
+Percentage of Total MACs: 6.08%
+
+Layer: layer_3
+------------------------------
+MAC Efficiency: 32.73%
+Energy Consumed: 15773428901750.40 pJ
+MACs Performed: 6177024
+Dense MACs Possible: 18874368
+Percentage of Total Energy: 0.22%
+Percentage of Total MACs: 2.07%
+
+Layer: layer_4
+------------------------------
+MAC Efficiency: 26.62%
+Energy Consumed: 74444852984918.39 pJ
+MACs Performed: 20100864
+Dense MACs Possible: 75497472
+Percentage of Total Energy: 1.03%
+Percentage of Total MACs: 6.73%
+
+Layer: layer_5
+------------------------------
+MAC Efficiency: 15.53%
+Energy Consumed: 56310696752256.01 pJ
+MACs Performed: 5861888
+Dense MACs Possible: 37748736
+Percentage of Total Energy: 0.78%
+Percentage of Total MACs: 1.96%
+
+Layer: layer_6
+------------------------------
+MAC Efficiency: 30.50%
+Energy Consumed: 309300731369971.19 pJ
+MACs Performed: 46052608
+Dense MACs Possible: 150994944
+Percentage of Total Energy: 4.26%
+Percentage of Total MACs: 15.42%
+
+Layer: layer_7
+------------------------------
+MAC Efficiency: 3.02%
+Energy Consumed: 415217406365414.44 pJ
+MACs Performed: 4559872
+Dense MACs Possible: 150994944
+Percentage of Total Energy: 5.72%
+Percentage of Total MACs: 1.53%
+
+Layer: layer_8
+------------------------------
+MAC Efficiency: 46.14%
+Energy Consumed: 248674594661318.41 pJ
+MACs Performed: 34838016
+Dense MACs Possible: 75497472
+Percentage of Total Energy: 3.43%
+Percentage of Total MACs: 11.67%
+
+Layer: layer_9
+------------------------------
+MAC Efficiency: 24.37%
+Energy Consumed: 1443507473071641.75 pJ
+MACs Performed: 73601024
+Dense MACs Possible: 301989888
+Percentage of Total Energy: 19.90%
+Percentage of Total MACs: 24.65%
+
+Layer: layer_10
+------------------------------
+MAC Efficiency: 6.74%
+Energy Consumed: 1832855545519334.25 pJ
+MACs Performed: 20346368
+Dense MACs Possible: 301989888
+Percentage of Total Energy: 25.26%
+Percentage of Total MACs: 6.81%
+
+Layer: layer_11
+------------------------------
+MAC Efficiency: 45.73%
+Energy Consumed: 515975379180825.75 pJ
+MACs Performed: 34522112
+Dense MACs Possible: 75497472
+Percentage of Total Energy: 7.11%
+Percentage of Total MACs: 11.56%
+
+Layer: layer_12
+------------------------------
+MAC Efficiency: 9.03%
+Energy Consumed: 1130982449153433.50 pJ
+MACs Performed: 13634560
+Dense MACs Possible: 150994944
+Percentage of Total Energy: 15.59%
+Percentage of Total MACs: 4.57%
+
+Layer: layer_13
+------------------------------
+MAC Efficiency: 12.62%
+Energy Consumed: 1199901287602637.00 pJ
+MACs Performed: 19058688
+Dense MACs Possible: 150994944
+Percentage of Total Energy: 16.54%
+Percentage of Total MACs: 6.38%
+
+
+Overall Statistics
+=================
+Total Energy: 7255466451917628.00 pJ
+Total MAC Efficiency: 19.51%
+Total MACs: 298619712 / 1530593280

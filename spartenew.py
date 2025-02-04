@@ -1,23 +1,39 @@
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
-from collections import deque
+from torch.hub import load_state_dict_from_url
+import torch
+import torch.nn as nn
+import site
+import sys
+
+@dataclass
+class PowerSpecs:
+    """Power specifications from Table 4 in paper (45nm)"""
+    CLOCK_FREQ = 800e6  # 800 MHz
+    CLOCK_PERIOD = 1/CLOCK_FREQ  # seconds
+    
+    # Power values in Watts (converted from mW)
+    BUFFER_POWER = 19.2e-3
+    PREFIX_SUM_POWER = 48.0e-3
+    PRIORITY_ENCODER_POWER = 6.4e-3
+    MAC_POWER = 13.82e-3
+    PERMUTE_POWER = 10.6e-3
+    OTHER_POWER = 20.28e-3
 
 @dataclass
 class SparseData:
-    sparsemap: np.ndarray  
-    values: np.ndarray     
-    original_shape: Tuple[int, ...]  
+    sparsemap: np.ndarray
+    values: np.ndarray
+    original_shape: Tuple[int, ...]
 
     @classmethod
     def from_dense(cls, data: np.ndarray):
-        """Convert dense array to sparse format"""
         sparsemap = (data != 0).astype(np.uint8)
         values = data[data != 0]
         return cls(sparsemap, values, data.shape)
     
     def get_values_at_positions(self, positions: np.ndarray) -> np.ndarray:
-        """Get values at specific positions in the sparsemap"""
         value_indices = np.zeros_like(positions)
         for i, pos in enumerate(positions):
             value_indices[i] = np.sum(self.sparsemap[:pos])
@@ -25,10 +41,9 @@ class SparseData:
 
 @dataclass
 class MACUnit:
-    """Represents a single multiply-accumulate unit"""
     def __init__(self):
         self.accumulator = 0.0
-        self.debug_multiplications = []  # Store multiplications for debugging
+        self.debug_multiplications = []
         
     def multiply_accumulate(self, a: float, b: float):
         self.debug_multiplications.append((a, b))
@@ -45,69 +60,87 @@ class MACUnit:
         self.debug_multiplications = []
 
 @dataclass
+class EnergyStats:
+    def __init__(self):
+        self.cycles = {
+            'and': 0,
+            'priority_encode': 0,
+            'prefix_sum': 0,
+            'memory': 0,
+            'mac': 0,
+            'buffer': 0,
+        }
+        
+    def compute_energy(self):
+        """Compute energy in picoJoules"""
+        energy = {
+            'and': self.cycles['and'] * PowerSpecs.OTHER_POWER * PowerSpecs.CLOCK_PERIOD,
+            'priority_encode': self.cycles['priority_encode'] * PowerSpecs.PRIORITY_ENCODER_POWER * PowerSpecs.CLOCK_PERIOD,
+            'prefix_sum': self.cycles['prefix_sum'] * PowerSpecs.PREFIX_SUM_POWER * PowerSpecs.CLOCK_PERIOD,
+            'memory': self.cycles['memory'] * PowerSpecs.OTHER_POWER * PowerSpecs.CLOCK_PERIOD,
+            'mac': self.cycles['mac'] * PowerSpecs.MAC_POWER * PowerSpecs.CLOCK_PERIOD,
+            'buffer': self.cycles['buffer'] * PowerSpecs.BUFFER_POWER * PowerSpecs.CLOCK_PERIOD,
+        }
+        return {k: v * 1e12 for k, v in energy.items()}  # Convert to picoJoules
+
+@dataclass
 class ComputeUnit:
     id: int
-    pipeline_stages: dict = None
-    current_stage: str = None
-    stage_cycle_count: int = 0
+    assigned_filter_idx: int = None
     
     def __post_init__(self):
         self.mac_unit = MACUnit()
-        self.pipeline_stages = {
-            'and': None,
-            'priority_encode': None,
-            'prefix_sum': None,
-            'memory': None,
-            'mac': None
-        }
-
-    def process_sparse_multiply(self, filter_chunk: SparseData, input_chunk: SparseData) -> Tuple[int, int]:
-        """Process sparse multiplication through pipeline stages"""
-        # Initial AND operation (1 cycle)
-        matches = filter_chunk.sparsemap & input_chunk.sparsemap
+        self.filter_buffer = None
+        self.energy_stats = EnergyStats()
+    
+    def assign_filter(self, filter_idx: int):
+        """Assign a filter to this compute unit"""
+        self.assigned_filter_idx = filter_idx
+        print(f"CU{self.id} assigned Filter {filter_idx}")
+    
+    def process_sparse_multiply(self, input_chunk: SparseData) -> Tuple[int, int, Dict]:
+        if self.filter_buffer is None:
+            return 0, 0, self.energy_stats
+            
+        # Buffer active during entire operation
+        self.energy_stats.cycles['buffer'] += 1
+        
+        # AND operation
+        matches = self.filter_buffer.sparsemap & input_chunk.sparsemap
         match_positions = np.where(matches)[0]
-        total_cycles = 0
+        self.energy_stats.cycles['and'] += 1
         total_macs = len(match_positions)
+        dense_macs = len(self.filter_buffer.sparsemap)  # Total possible MACs
         
-        print(f"\nCU{self.id} processing:")
-        print(f"  Filter sparsemap: {filter_chunk.sparsemap}")
-        print(f"  Filter values: {filter_chunk.values}")
-        print(f"  Input sparsemap: {input_chunk.sparsemap}")
-        print(f"  Input values: {input_chunk.values}")
-        print(f"  Found {len(match_positions)} matches at positions: {match_positions}")
+        print(f"\nCU{self.id} (Filter {self.assigned_filter_idx}) processing:")
+        print(f"  Found {total_macs} matches out of {dense_macs} possible")
         
-        # For each matching position, go through pipeline
         for pos_idx, pos in enumerate(match_positions):
-            # Pipeline stages timing
-            if pos_idx > 0:
-                total_cycles += 2  # AND + priority encode
-            else:
-                total_cycles += 1  # just priority encode since AND is done
-                
-            # Prefix Sum (1 cycle)
-            filter_offset = np.sum(filter_chunk.sparsemap[:pos])
+            # Priority encode and prefix sum
+            self.energy_stats.cycles['priority_encode'] += 1
+            self.energy_stats.cycles['prefix_sum'] += 1
+            
+            # Memory access
+            filter_offset = np.sum(self.filter_buffer.sparsemap[:pos])
             input_offset = np.sum(input_chunk.sparsemap[:pos])
-            total_cycles += 1
+            self.energy_stats.cycles['memory'] += 1
             
-            # Memory Access (1 cycle)
-            filter_val = filter_chunk.values[filter_offset]
+            # MAC operation
+            filter_val = self.filter_buffer.values[filter_offset]
             input_val = input_chunk.values[input_offset]
-            total_cycles += 1
-            
-            # MAC Operation (1 cycle)
             self.mac_unit.multiply_accumulate(filter_val, input_val)
-            total_cycles += 1
+            self.energy_stats.cycles['mac'] += 1
             
-            print(f"  Position {pos}: filter_val={filter_val} * input_val={input_val}")
-            
-        if not match_positions.size:
-            print("  No matches found")
-            total_cycles = 4  # minimum pipeline stages
-            
-        print(f"  Total cycles: {total_cycles}")
-        print(f"  Current accumulator value: {self.mac_unit.get_result()}")
+        energy = self.energy_stats.compute_energy()
+        total_energy = sum(energy.values())
         
-        return total_cycles, total_macs
+        print(f"  MAC efficiency: {(total_macs/dense_macs)*100:.2f}%")
+        if((total_macs/dense_macs) == 1):
+            print(self.filter_buffer.sparsemap)
+            print(match_positions)
+        print(f"  Energy consumed: {total_energy:.2f} pJ")
+        
+        return total_macs, dense_macs, self.energy_stats
 
 class SparTenCluster:
     def __init__(self, num_compute_units: int = 32, chunk_size: int = 128):
@@ -115,259 +148,363 @@ class SparTenCluster:
         self.chunk_size = chunk_size
         self.compute_units = [ComputeUnit(i) for i in range(num_compute_units)]
         self.current_cycle = 0
-        self.partial_sums = {}  # Store partial sums for each filter
-        self.num_filters = 0  # Track total number of filters
-            
-    def process_chunk(self, filter_chunks: List[SparseData], input_chunk: SparseData, 
-                     is_last_chunk: bool) -> List[float]:
-        print(f"\nProcessing {'last' if is_last_chunk else 'new'} chunk at cycle {self.current_cycle}")
-        print(f"Input chunk sparsemap: {input_chunk.sparsemap}")
-        print(f"Input chunk values: {input_chunk.values}")
         
-        print("\nFilter assignments to Compute Units:")
-        for i, fc in enumerate(filter_chunks):
-            print(f"CU{i} <- Filter sparsemap: {fc.sparsemap}, values: {fc.values}")
-            
-        # Calculate total number of filters if first chunk
-        if self.current_cycle == 0:
-            self.num_filters = len(filter_chunks) // 2  # Assuming 2 chunks per filter
+    def process_input(self, filters: np.ndarray, input_data: np.ndarray) -> Tuple[List[float], Dict]:
+        num_filters = len(filters)
         
-        # First identify all matches that need to be processed
-        all_matches = []
-        print("\nChecking for non-zero matches:")
-        for chunk_idx, filter_chunk in enumerate(filter_chunks):
-            filter_idx = chunk_idx // 2  # Calculate actual filter index
-            matches = filter_chunk.sparsemap & input_chunk.sparsemap
-            match_positions = np.where(matches)[0]
-            if len(match_positions) > 0:
-                print(f"Filter {filter_idx} has {len(match_positions)} matches at positions: {match_positions}")
-                filter_values = filter_chunk.get_values_at_positions(match_positions)
-                input_values = input_chunk.get_values_at_positions(match_positions)
-                print(f"     Values to multiply: {filter_values} * {input_values}")
-                all_matches.append((filter_idx, match_positions, filter_chunk))
-            
-        if not all_matches:
-            print("No matches found in any filters")
-            return []
-            
-        # Process matches in pipelined rounds based on available compute units
-        total_rounds = (len(all_matches) + self.num_compute_units - 1) // self.num_compute_units
+        print("\nAssigning filters to compute units:")
+        for i in range(min(num_filters, self.num_compute_units)):
+            self.compute_units[i].assign_filter(i)
+        
+        total_energy = 0
         total_macs = 0
+        total_dense_macs = 0
         
-        print(f"\nProcessing {len(all_matches)} filter matches in {total_rounds} pipelined rounds using {self.num_compute_units} compute units")
+        chunk_size = self.chunk_size
+        num_chunks = (input_data.shape[0] + chunk_size - 1) // chunk_size
         
-        # Calculate total cycles needed
-        total_cycles = 5 + (total_rounds - 1)
+        print(f"\nProcessing {num_chunks} chunks")
         
-        # Pipeline execution visualization
-        print("\nPipeline Execution:")
-        base_cycle = self.current_cycle
-        for cycle in range(total_cycles):
-            current_cycle = base_cycle + cycle + 1
-            print(f"\nCycle {current_cycle}:")
-            for round_idx in range(total_rounds):
-                if cycle >= round_idx and cycle < round_idx + 5:
-                    stage_idx = cycle - round_idx
-                    stage_name = ['AND', 'Priority Encode', 'Prefix Sum', 'Memory', 'MAC'][stage_idx]
-                    print(f"  Round {round_idx + 1}: {stage_name} stage")
-        
-        self.current_cycle += total_cycles
-        
-        results = []
-        # Process each round
-        for round_idx in range(total_rounds):
-            # Reset MAC units at start of each round
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min((chunk_idx + 1) * chunk_size, input_data.shape[0])
+            
+            print(f"\nProcessing chunk {chunk_idx + 1}/{num_chunks}")
+            input_chunk = SparseData.from_dense(input_data[chunk_start:chunk_end])
+            
             for cu in self.compute_units:
-                cu.mac_unit.reset()
-                
-            start_idx = round_idx * self.num_compute_units
-            end_idx = min(start_idx + self.num_compute_units, len(all_matches))
-            round_matches = all_matches[start_idx:end_idx]
-            
-            print(f"\nRound {round_idx + 1} processing:")
-            
-            # Process matches in this round
-            for cu_idx, (filter_idx, match_positions, filter_chunk) in enumerate(round_matches):
-                cu = self.compute_units[cu_idx]
-                print(f"CU{cu_idx} processing Filter {filter_idx}")
-                
-                cycles, macs = cu.process_sparse_multiply(filter_chunk, input_chunk)
-                total_macs += macs
-                
-                # Get result and add to previous partial sum if it exists
-                result = cu.mac_unit.get_result()
-                if filter_idx in self.partial_sums:
-                    result += self.partial_sums[filter_idx]
-                
-                if is_last_chunk:
-                    results.append((filter_idx, result))
-                else:
-                    self.partial_sums[filter_idx] = result
-                
-                print(f"\nCU{cu_idx} (Filter {filter_idx}):")
-                if is_last_chunk:
-                    print(f"  Final result: {result}")
-                else:
-                    print(f"  Partial sum: {result}")
-                print(f"  Multiplications performed: {cu.mac_unit.get_debug_info()}")
+                if cu.assigned_filter_idx is not None:
+                    filter_chunk = filters[cu.assigned_filter_idx, chunk_start:chunk_end]
+                    cu.filter_buffer = SparseData.from_dense(filter_chunk)
+                    
+                    macs, dense_macs, energy_stats = cu.process_sparse_multiply(input_chunk)
+                    total_macs += macs
+                    total_dense_macs += dense_macs
+                    total_energy += sum(energy_stats.compute_energy().values())
         
-        print(f"\nAll pipelined rounds complete at cycle {self.current_cycle}")
-        print(f"Total cycles taken: {total_cycles}")
-        print(f"Total MAC operations performed: {total_macs}")
+        # Collect results
+        results = []
+        print("\nFinal Statistics:")
+        print(f"Total MACs performed: {total_macs}")
+        print(f"Total dense MACs possible: {total_dense_macs}")
+        print(f"Overall MAC efficiency: {(total_macs/total_dense_macs)*100:.2f}%")
+        print(f"Total energy consumed: {total_energy:.2f} pJ")
         
-        if is_last_chunk:
-            # Ensure all filters have a result (even if zero)
-            final_results = []
-            for i in range(self.num_filters):
-                if i not in [r[0] for r in results]:
-                    final_results.append((i, 0.0))  # Add zero for filters with no matches
-            final_results.extend(results)
-            
-            # Sort by filter index and extract just the values
-            final_results.sort(key=lambda x: x[0])
-            final_results = [r[1] for r in final_results]
-            
-            print("\nFinal results for all filters:", final_results)
-            # Clear partial sums and filter count for next computation
-            self.partial_sums.clear()
-            self.num_filters = 0
-            return final_results
+        for cu in self.compute_units:
+            if cu.assigned_filter_idx is not None:
+                results.append((cu.assigned_filter_idx, cu.mac_unit.get_result()))
         
-        return []
-
+        results.sort(key=lambda x: x[0])
+        return [r[1] for r in results], {
+            'total_energy': total_energy,
+            'total_macs': total_macs,
+            'dense_macs': total_dense_macs,
+            'mac_efficiency': (total_macs/total_dense_macs)*100
+        }
 def verify_computation(filters: np.ndarray, inputs: np.ndarray, sparse_results: List[float]):
-    """Verify sparse computation against dense computation"""
-    print("\nVerifying computation:")
-    print(f"Original dense filters shape: {filters.shape}")
-    print(f"Original dense inputs shape: {inputs.shape}")
-    
-    # Compute dense results but only keep non-zero results
     dense_results = []
-    for f in filters:
+    for f, sparse_result in zip(filters, sparse_results):
         result = np.sum(f * inputs)
-        # Only include non-zero results to match sparse computation behavior
-        if result != 0:
+        dense_results.append(result)  # Include all results, not just non-zero
+    
+    print("Dense results:", dense_results)
+    print("Sparse results:", sparse_results)
+    
+    matches = np.allclose(dense_results, sparse_results, rtol=1e-05, atol=1e-08)
+    if matches:
+        print("✅ Verification PASSED")
+    else:
+        print("❌ Verification FAILED")
+        print("Differences:", np.array(dense_results) - np.array(sparse_results))
+    
+    return matches
+def test_sparten():
+    print("Running SparTen Tests...")
+    
+    # Test 1: Simple test with known sparsity
+    print("\nTest 1: Simple sparse matrix")
+    filters = np.array([
+        [1, 0, 3, 0],  # 50% sparse
+        [0, 2, 0, 4]   # 50% sparse
+    ])
+    inputs = np.array([1, 2, 0, 4])  # 25% sparse
+    
+    cluster = SparTenCluster(num_compute_units=2, chunk_size=4)
+    results, stats = cluster.process_input(filters, inputs)
+    verify_computation(filters, inputs, results)
+    print("\nResults:", results)
+    print("Statistics:", stats)
+    
+    # Test 2: High sparsity test
+    print("\nTest 2: High sparsity test")
+    filters = np.zeros((2, 8))
+    filters[0, [0, 7]] = [1, 2]  # 75% sparse
+    filters[1, [3, 4]] = [3, 4]  # 75% sparse
+    
+    inputs = np.zeros(8)
+    inputs[[0, 4]] = [5, 6]  # 75% sparse
+    
+    cluster = SparTenCluster(num_compute_units=2, chunk_size=4)
+    results, stats = cluster.process_input(filters, inputs)
+    verify_computation(filters, inputs, results)
+    print("\nResults:", results)
+    print("Statistics:", stats)
+    
+    # Test 3: Multi-chunk processing
+    print("\nTest 3: Multi-chunk processing")
+    filters = np.zeros((4, 12))
+    filters[0, [0, 4, 8]] = [1, 2, 3]
+    filters[1, [1, 5, 9]] = [4, 5, 6]
+    filters[2, [2, 6, 10]] = [7, 8, 9]
+    filters[3, [3, 7, 11]] = [10, 11, 12]
+    
+    inputs = np.zeros(12)
+    inputs[[0, 3, 6, 9]] = [13, 14, 15, 16]
+    
+    cluster = SparTenCluster(num_compute_units=4, chunk_size=4)
+    results, stats = cluster.process_input(filters, inputs)
+    verify_computation(filters, inputs, results)
+    print("\nResults:", results)
+    print("Statistics:", stats)
+
+def verify_multi_round_processing(filters_2d: np.ndarray, input_patch: np.ndarray, 
+                                sparse_results: np.ndarray, round_idx: int, 
+                                filter_start: int, filter_end: int):
+    """Verify results for each round of processing"""
+    print(f"\nVerifying round {round_idx + 1}")
+    print(f"Processing filters {filter_start} to {filter_end-1}")
+    
+    # Print shapes for debugging
+    current_filters = filters_2d[filter_start:filter_end]
+    print(f"Filter shape: {current_filters[0].shape}")
+    print(f"Input patch shape: {input_patch.shape}")
+    
+    # Always reshape input patch regardless of shape match
+    try:
+        input_patch_reshaped = input_patch.reshape(current_filters[0].shape)
+    except ValueError:
+        print("Error: Cannot reshape input patch to match filter shape")
+        print(f"Filter elements: {current_filters[0].size}")
+        print(f"Input patch elements: {input_patch.size}")
+        return False
+        
+    # Calculate expected results for this round
+    dense_results = []
+    for f in current_filters:
+        try:
+            result = np.sum(f * input_patch_reshaped)
             dense_results.append(result)
+            
+            # Print detailed multiplication info
+            non_zero_pairs = np.count_nonzero(f * (input_patch_reshaped != 0))
+            print(f"Non-zero multiplications: {non_zero_pairs} out of {len(f)}")
+        except ValueError as e:
+            print(f"Error in multiplication:")
+            print(f"Filter shape: {f.shape}")
+            print(f"Input shape: {input_patch_reshaped.shape}")
+            return False
+    
+    # Compare with sparse results
+    matches = np.allclose(dense_results, sparse_results, rtol=1e-05, atol=1e-08)
     
     print("\nResults comparison:")
     print("Dense results:", dense_results)
     print("Sparse results:", sparse_results)
-    
-    # Compare results
-    if len(dense_results) != len(sparse_results):
-        print("Number of results doesn't match!")
-        print(f"Dense results length: {len(dense_results)}")
-        print(f"Sparse results length: {len(sparse_results)}")
-        return False
-    
-    matches = np.allclose(dense_results, sparse_results, rtol=1e-05, atol=1e-08)
     if matches:
-        print("✅ Verification PASSED: Results match!")
+        print("✅ Round verification PASSED")
     else:
-        print("❌ Verification FAILED: Results don't match!")
+        print("❌ Round verification FAILED")
         print("Differences:", np.array(dense_results) - np.array(sparse_results))
+        exit()
     
     return matches
 
-def test_sparten_simulator():
-    print("Running SparTen Simulator Tests...")
-    
-    print("\nTest Case 1: Simple sparse matrix multiplication")
-    filters = np.array([
-        [1, 0, 3, 0],
-        [0, 2, 0, 4]
-    ])
-    inputs = np.array([1, 2, 0, 4])
-    
-    expected_results = [1*1 + 3*0, 2*2 + 4*4]  # [1, 20]
-    print(f"Expected results: {expected_results}")
-    
-    # Convert to sparse format
-    filter_chunks = [SparseData.from_dense(f) for f in filters]
-    input_chunk = SparseData.from_dense(inputs)
-    
-    # Create cluster and process
-    cluster = SparTenCluster(num_compute_units=2, chunk_size=4)
-    results = cluster.process_chunk(filter_chunks, input_chunk, is_last_chunk=True)
-    
-    print("\nVerifying Test Case 1:")
-    verify_computation(filters, inputs, results)
+def save_layer_stats(stats: dict, filename: str = "vgg16_layer_stats.txt"):
+    with open(filename, 'w') as f:
+        f.write("VGG-16 Layer-wise Statistics\n")
+        f.write("===========================\n\n")
+        
+        total_energy = sum(stat['total_energy'] for stat in stats.values())  # Changed key
+        total_macs = sum(stat['total_macs'] for stat in stats.values())
+        total_dense_macs = sum(stat['dense_macs'] for stat in stats.values())
+        
+        for layer_name, layer_stats in stats.items():
+            f.write(f"Layer: {layer_name}\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"MAC Efficiency: {layer_stats['mac_efficiency']:.2f}%\n")
+            f.write(f"Energy Consumed: {layer_stats['total_energy']:.2f} pJ\n")  # Changed key
+            f.write(f"MACs Performed: {layer_stats['total_macs']}\n")
+            f.write(f"Dense MACs Possible: {layer_stats['dense_macs']}\n")
+            f.write(f"Percentage of Total Energy: {(layer_stats['total_energy']/total_energy)*100:.2f}%\n")
+            f.write(f"Percentage of Total MACs: {(layer_stats['total_macs']/total_macs)*100:.2f}%\n\n")
+        
+        f.write("\nOverall Statistics\n")
+        f.write("=================\n")
+        f.write(f"Total Energy: {total_energy:.2f} pJ\n")
+        f.write(f"Total MAC Efficiency: {(total_macs/total_dense_macs)*100:.2f}%\n")
+        f.write(f"Total MACs: {total_macs} / {total_dense_macs}\n")
 
-    print("\nTest Case 2: More matches than compute units")
-    filters = np.array([
-        [1, 0, 0, 2],  # 2 matches when paired with input
-        [0, 3, 0, 4],  # 2 matches
-        [5, 0, 6, 0],  # 1 match
-        [0, 7, 0, 8]   # 2 matches
-    ])
-    inputs = np.array([1, 3, 0, 4])  # Will create multiple matches with filters
+def process_conv_layer(filters_4d: np.ndarray, input_feature_map: np.ndarray, 
+                      cluster: SparTenCluster, stride: int = 1, padding: int = 1):
+    """Process one convolutional layer with verification"""
+    num_filters, in_channels, fh, fw = filters_4d.shape
+    ih, iw, ic = input_feature_map.shape
     
-    print(f"\nInput array: {inputs}")
-    print("Filters:")
-    print(filters)
-    print("\nExpected matches per filter:")
-    for i, f in enumerate(filters):
-        matches = np.where((f != 0) & (inputs != 0))[0]
-        print(f"Filter {i}: {len(matches)} matches at positions {matches}")
+    # Print sparsity check for input matrices
+    print("\nSparsity Check:")
+    print(f"Filter non-zeros: {np.count_nonzero(filters_4d)} out of {filters_4d.size}")
+    print(f"Input non-zeros: {np.count_nonzero(input_feature_map)} out of {input_feature_map.size}")
     
-    # Convert to sparse format
-    filter_chunks = [SparseData.from_dense(f) for f in filters]
-    input_chunk = SparseData.from_dense(inputs)
+    if padding > 0:
+        padded_input = np.pad(input_feature_map, 
+                            ((padding, padding), (padding, padding), (0, 0)),
+                            mode='constant')
+    else:
+        padded_input = input_feature_map
     
-    # Process with only 2 compute units - should need multiple rounds
-    cluster = SparTenCluster(num_compute_units=2, chunk_size=4)
-    results = cluster.process_chunk(filter_chunks, input_chunk, is_last_chunk=True)
+    out_h = (ih + 2*padding - fh) // stride + 1
+    out_w = (iw + 2*padding - fw) // stride + 1
+    filters_2d = filters_4d.reshape(num_filters, -1)
+    output = np.zeros((out_h, out_w, num_filters))
     
-    print("\nVerifying Test Case 2:")
-    verify_computation(filters, inputs, results)
+    total_energy = 0
+    total_macs = 0
+    total_dense_macs = 0
+    all_rounds_verified = True
+    
+    # Process each spatial position
+    for i in range(0, out_h):
+        for j in range(0, out_w):
+            print(f"\nProcessing spatial position ({i},{j})")
+            
+            h_start = i * stride
+            h_end = h_start + fh
+            w_start = j * stride
+            w_end = w_start + fw
+            patch = padded_input[h_start:h_end, w_start:w_end, :]
+            patch_flat = patch.reshape(-1)
+            
+            # Reset all compute units before starting new position
+            for cu in cluster.compute_units:
+                cu.mac_unit.reset()
+            
+            # Process filters in rounds
+            for round_idx, filter_start in enumerate(range(0, num_filters, cluster.num_compute_units)):
+                filter_end = min(filter_start + cluster.num_compute_units, num_filters)
+                current_filters = filters_2d[filter_start:filter_end]
+                
+                # Reset MACs before each round
+                for cu in cluster.compute_units:
+                    cu.mac_unit.reset()
+                
+                results, stats = cluster.process_input(current_filters, patch_flat)
+                
+                # Print detailed stats for this round
+                print(f"\nRound {round_idx + 1} Stats:")
+                print(f"Processing filters {filter_start} to {filter_end-1}")
+                print(f"Current filters non-zeros: {np.count_nonzero(current_filters)} out of {current_filters.size}")
+                print(f"Patch non-zeros: {np.count_nonzero(patch_flat)} out of {patch_flat.size}")
+                
+                round_verified = verify_multi_round_processing(
+                    filters_2d, patch_flat, results, round_idx, 
+                    filter_start, filter_end
+                )
+                all_rounds_verified &= round_verified
+                
+                output[i, j, filter_start:filter_end] = results
+                total_energy += stats['total_energy']
+                total_macs += stats['total_macs']
+                total_dense_macs += stats['dense_macs']
+    
+    # Print final sparsity stats
+    mac_efficiency = (total_macs/total_dense_macs)*100 if total_dense_macs > 0 else 0
+    print("\nFinal Statistics:")
+    print(f"Total MACs performed: {total_macs}")
+    print(f"Total dense MACs possible: {total_dense_macs}")
+    print(f"MAC efficiency: {mac_efficiency:.2f}%")
+    
+    return output, {
+        'total_energy': total_energy,
+        'total_macs': total_macs,
+        'dense_macs': total_dense_macs,
+        'mac_efficiency': mac_efficiency,
+        'verified': all_rounds_verified
+    }
 
-    print("\nTest Case 3: Larger sparse matrix with multiple chunks")
-    filters = np.zeros((6, 8))  # 6 filters
-    # Set some values to create specific match patterns
-    filters[0, [0, 4]] = [1, 2]
-    filters[1, [1, 5]] = [3, 4]
-    filters[2, [2, 6]] = [5, 6]
-    filters[3, [0, 7]] = [7, 8]
-    filters[4, [1, 4]] = [9, 10]
-    filters[5, [3, 5]] = [11, 12]
+def test_vgg16_sparten():
+    print("Loading CIFAR10 pre-trained VGG16...")
+    try:
+        model = torch.hub.load('chenyaofo/pytorch-cifar-models', 'cifar10_vgg16_bn', pretrained=True)
+    except:
+        print("Failed to load from torch.hub, trying timm...")
+        import timm
+        model = timm.create_model('vgg16_bn_cifar10', pretrained=True)
+
+    # Extract conv layer configurations
+    conv_layers = []
+    for name, module in model.features.named_children():
+        if isinstance(module, torch.nn.Conv2d):
+            weights = module.weight.data.cpu().numpy()
+            conv_layers.append(weights)
+            print(f"\nConv Layer {len(conv_layers)}:")
+            print(f"Shape: {weights.shape}")
+            print(f"Sparsity: {(1 - np.count_nonzero(weights)/weights.size)*100:.2f}%")
+
+    # Create random input of correct size for CIFAR10 (32x32x3)
+    input_data = np.random.randn(32, 32, 3)
+    current_input = input_data
+
+    # Create cluster with paper's configuration
+    cluster = SparTenCluster(num_compute_units=32, chunk_size=128)
     
-    inputs = np.zeros(8)
-    inputs[[0, 1, 4, 5]] = [7, 8, 9, 10]  # Will create multiple matches with filters
+    # Process each layer
+    layer_stats = {}
     
-    print("\nInput array:", inputs)
-    print("Filters:")
-    print(filters)
-    print("\nExpected matches per filter:")
-    for i, f in enumerate(filters):
-        matches = np.where((f != 0) & (inputs != 0))[0]
-        print(f"Filter {i}: {len(matches)} matches at positions {matches}")
+    for layer_idx, filters in enumerate(conv_layers):
+        print(f"\nProcessing layer {layer_idx+1}")
+        
+        # Process through SparTen
+        output, stats = process_conv_layer(filters, current_input, cluster)
+        
+        # Store statistics
+        layer_stats[f'layer_{layer_idx+1}'] = stats
+        
+        # Apply ReLU
+        output = np.maximum(0, output)
+        
+        # Apply MaxPool if needed (after certain layers according to VGG16 architecture)
+        if layer_idx in [1, 3, 6, 9, 12]:  # MaxPool layers in VGG16
+            output = output.reshape(1, *output.shape)
+            output = torch.nn.functional.max_pool2d(
+                torch.from_numpy(output), 
+                kernel_size=2, 
+                stride=2
+            ).numpy()[0]
+        
+        current_input = output
+        
+        # Print layer statistics
+        print(f"Layer {layer_idx+1} Statistics:")
+        print(f"Shape: {current_input.shape}")
+        print(f"MAC Efficiency: {stats['mac_efficiency']:.2f}%")
+        print(f"Energy: {stats['total_energy']:.2f} pJ")
+        print(f"MACs: {stats['total_macs']} / {stats['dense_macs']}")
     
-    # Split into chunks and convert to sparse
-    chunk_size = 4
-    filter_chunks = []
-    for f in filters:
-        chunks = [f[i:i+chunk_size] for i in range(0, len(f), chunk_size)]
-        filter_chunks.extend([SparseData.from_dense(chunk) for chunk in chunks])
+    # Save detailed statistics to file
+    save_layer_stats(layer_stats, "vgg16_cifar10_stats.txt")
     
-    input_chunks = [inputs[i:i+chunk_size] for i in range(0, len(inputs), chunk_size)]
-    input_chunks = [SparseData.from_dense(chunk) for chunk in input_chunks]
+    # Print overall statistics
+    print("\nOverall VGG16-CIFAR10 Statistics:")
+    total_energy = sum(stat['total_energy'] for stat in layer_stats.values())
+    total_macs = sum(stat['total_macs'] for stat in layer_stats.values())
+    total_dense_macs = sum(stat['dense_macs'] for stat in layer_stats.values())
     
-    # Process chunks with only 2 compute units
-    cluster = SparTenCluster(num_compute_units=2, chunk_size=chunk_size)
-    final_results = []
+    print(f"Total Energy: {total_energy:.2f} pJ")
+    print(f"Total MAC Efficiency: {(total_macs/total_dense_macs)*100:.2f}%")
+    print(f"Total MACs: {total_macs} / {total_dense_macs}")
     
-    for chunk_idx, input_chunk in enumerate(input_chunks):
-        is_last = chunk_idx == len(input_chunks) - 1
-        chunk_results = cluster.process_chunk(
-            filter_chunks[chunk_idx::len(input_chunks)], 
-            input_chunk,
-            is_last
-        )
-        if is_last:
-            final_results = chunk_results
-    
-    print("\nVerifying Test Case 3:")
-    verify_computation(filters, inputs, final_results)
+    return layer_stats
 
 if __name__ == "__main__":
-    test_sparten_simulator()
+    # Run test and collect statistics
+    stats = test_vgg16_sparten()
