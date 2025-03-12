@@ -1,0 +1,750 @@
+$date
+	Thu Feb 27 16:33:22 2025
+$end
+$version
+	Icarus Verilog
+$end
+$timescale
+	1s
+$end
+$scope module accumulator_correction_tb $end
+$var wire 1 ! result_valid $end
+$var wire 10 " result_3 [9:0] $end
+$var wire 10 # result_2 [9:0] $end
+$var wire 10 $ result_1 [9:0] $end
+$var wire 10 % result_0 [9:0] $end
+$var wire 1 & ready_for_slow $end
+$var wire 1 ' ready_for_fast $end
+$var wire 1 ( fifo_read_req $end
+$var wire 1 ) fibre_a_read_en $end
+$var wire 8 * fibre_a_addr [7:0] $end
+$var parameter 32 + ADDR_WIDTH $end
+$var parameter 32 , COMPLETE $end
+$var parameter 32 - CORRECTION $end
+$var parameter 32 . CORRECTION_ACC_WIDTH $end
+$var parameter 32 / CORR_IDLE $end
+$var parameter 32 0 PSEUDO_ACC_WIDTH $end
+$var parameter 32 1 TIMESTEPS $end
+$var parameter 32 2 WAITING_FOR_DATA $end
+$var parameter 32 3 WAITING_FOR_FIFO $end
+$var parameter 32 4 WEIGHT_WIDTH $end
+$var reg 1 5 clk $end
+$var reg 7 6 current_position [6:0] $end
+$var reg 8 7 current_weight [7:0] $end
+$var reg 1 8 fast_valid $end
+$var reg 4 9 fibre_a_data [3:0] $end
+$var reg 1 : fibre_a_valid $end
+$var reg 1 ; fifo_empty $end
+$var reg 7 < matched_position [6:0] $end
+$var reg 8 = matched_weight [7:0] $end
+$var reg 1 > rst $end
+$var reg 7 ? slow_offset [6:0] $end
+$var reg 1 @ slow_valid $end
+$var reg 1 A test_done $end
+$var integer 32 B cycle_count [31:0] $end
+$var integer 32 C test_case [31:0] $end
+$var integer 32 D timeout [31:0] $end
+$scope function state_to_string $end
+$var reg 3 E state [2:0] $end
+$upscope $end
+$scope module uut $end
+$var wire 1 5 clk $end
+$var wire 7 F current_position [6:0] $end
+$var wire 8 G current_weight [7:0] $end
+$var wire 1 8 fast_valid $end
+$var wire 4 H fibre_a_data [3:0] $end
+$var wire 1 : fibre_a_valid $end
+$var wire 1 ; fifo_empty $end
+$var wire 7 I matched_position [6:0] $end
+$var wire 8 J matched_weight [7:0] $end
+$var wire 1 > rst $end
+$var wire 7 K slow_offset [6:0] $end
+$var wire 1 @ slow_valid $end
+$var parameter 32 L ADDR_WIDTH $end
+$var parameter 3 M COMPLETE $end
+$var parameter 3 N CORRECTION $end
+$var parameter 32 O CORRECTION_ACC_WIDTH $end
+$var parameter 3 P CORR_IDLE $end
+$var parameter 32 Q PSEUDO_ACC_WIDTH $end
+$var parameter 32 R TIMESTEPS $end
+$var parameter 3 S WAITING_FOR_DATA $end
+$var parameter 3 T WAITING_FOR_FIFO $end
+$var parameter 32 U WEIGHT_WIDTH $end
+$var reg 3 V corr_state [2:0] $end
+$var reg 8 W fibre_a_addr [7:0] $end
+$var reg 1 ) fibre_a_read_en $end
+$var reg 1 ( fifo_read_req $end
+$var reg 12 X pseudo_accumulator [11:0] $end
+$var reg 1 ' ready_for_fast $end
+$var reg 1 & ready_for_slow $end
+$var reg 10 Y result_0 [9:0] $end
+$var reg 10 Z result_1 [9:0] $end
+$var reg 10 [ result_2 [9:0] $end
+$var reg 10 \ result_3 [9:0] $end
+$var reg 1 ! result_valid $end
+$var reg 4 ] stored_fibre_a [3:0] $end
+$var reg 7 ^ stored_offset [6:0] $end
+$var reg 8 _ stored_weight [7:0] $end
+$upscope $end
+$scope task accumulate_weight $end
+$var reg 7 ` position [6:0] $end
+$var reg 8 a weight [7:0] $end
+$upscope $end
+$scope task memory_response $end
+$var reg 4 b data [3:0] $end
+$upscope $end
+$scope task run_test_case $end
+$var reg 8 c acc_weight [7:0] $end
+$var reg 8 d corr_weight [7:0] $end
+$var reg 4 e data_pattern [3:0] $end
+$var reg 8 f mem_addr [7:0] $end
+$var reg 1 g result_received $end
+$upscope $end
+$scope task start_correction $end
+$var reg 7 h offset [6:0] $end
+$var reg 8 i weight [7:0] $end
+$upscope $end
+$scope task wait_for_result $end
+$var reg 1 j result_received $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+$comment Show the parameter values. $end
+$dumpall
+b1000 U
+b1 T
+b10 S
+b100 R
+b1100 Q
+b0 P
+b1010 O
+b11 N
+b100 M
+b1000 L
+b1000 4
+b1 3
+b10 2
+b100 1
+b1100 0
+b0 /
+b1010 .
+b11 -
+b100 ,
+b1000 +
+$end
+#0
+$dumpvars
+xj
+bx i
+bx h
+xg
+bx f
+bx e
+bx d
+bx c
+bx b
+bx a
+bx `
+b0 _
+b0 ^
+b0 ]
+b0 \
+b0 [
+b0 Z
+b0 Y
+b0 X
+b0 W
+b0 V
+b0 K
+b0 J
+b0 I
+b0 H
+b0 G
+b0 F
+bx E
+b0 D
+b0 C
+b0 B
+0A
+0@
+b0 ?
+1>
+b0 =
+b0 <
+1;
+0:
+b0 9
+08
+b0 7
+b0 6
+05
+b0 *
+0)
+0(
+1'
+1&
+b0 %
+b0 $
+b0 #
+b0 "
+0!
+$end
+#5
+b0 E
+b1 B
+15
+#10
+05
+#15
+b10 B
+15
+#20
+05
+#25
+b11 B
+0>
+15
+#30
+05
+#35
+b11001 X
+18
+b110111 <
+b110111 I
+b11001 =
+b11001 J
+b110111 `
+b11001 a
+b101 f
+b1100 d
+b11001 c
+b1010 e
+b100 B
+15
+#40
+05
+#45
+b101 B
+08
+15
+#50
+05
+#55
+b110 B
+15
+#60
+05
+#65
+b1 V
+0&
+1(
+1@
+b1111 6
+b1111 F
+b1100 7
+b1100 G
+b101 ?
+b101 K
+0;
+b1100 i
+b101 h
+b111 B
+15
+#70
+05
+#75
+b10 V
+1)
+b101 *
+b101 W
+b101 ^
+b1100 _
+0(
+b1010 b
+b1 E
+b1000 B
+0@
+15
+#80
+05
+#85
+b11 V
+b1010 ]
+0)
+b10 E
+b1001 B
+1:
+b1010 9
+b1010 H
+15
+#90
+05
+#95
+b100 V
+b11001 "
+b11001 \
+b1101 #
+b1101 [
+b11001 $
+b11001 Z
+b1101 %
+b1101 Y
+0j
+0:
+b11 E
+b1010 B
+15
+#100
+05
+#105
+b0 V
+1&
+1!
+b100 E
+b1011 B
+b1 D
+15
+#110
+05
+#115
+0!
+b1 C
+1g
+1j
+b100 D
+b0 E
+b1100 B
+15
+#120
+05
+#125
+b1101 B
+15
+#130
+05
+#135
+b1110 B
+15
+#140
+05
+#145
+b1111 B
+15
+#150
+05
+#155
+b10000 B
+15
+#160
+05
+#165
+b1000001 X
+18
+b111010 <
+b111010 I
+b101000 =
+b101000 J
+b111010 `
+b101000 a
+b1000 f
+b1010 d
+b101000 c
+b1111 e
+b10001 B
+15
+#170
+05
+#175
+b10010 B
+08
+15
+#180
+05
+#185
+b10011 B
+15
+#190
+05
+#195
+b1 V
+0&
+1(
+1@
+b10010 6
+b10010 F
+b1010 7
+b1010 G
+b1000 ?
+b1000 K
+b1010 i
+b1000 h
+b10100 B
+15
+#200
+05
+#205
+b10 V
+1)
+b1000 *
+b1000 W
+b1000 ^
+b1010 _
+0(
+b1111 b
+b1 E
+b10101 B
+0@
+15
+#210
+05
+#215
+b100 V
+b1000001 "
+b1000001 \
+b1000001 #
+b1000001 [
+b1000001 $
+b1000001 Z
+b1000001 %
+b1000001 Y
+b1111 ]
+0)
+b10 E
+b10110 B
+1:
+b1111 9
+b1111 H
+15
+#220
+05
+#225
+b0 V
+1&
+1!
+0j
+b0 D
+0:
+b100 E
+b10111 B
+15
+#230
+05
+#235
+0!
+b10 C
+b0 E
+b11000 B
+1j
+b100 D
+15
+#240
+05
+#245
+b11001 B
+15
+#250
+05
+#255
+b11010 B
+15
+#260
+05
+#265
+b11011 B
+15
+#270
+05
+#275
+b11100 B
+15
+#280
+05
+#285
+b1010000 X
+18
+b111110 <
+b111110 I
+b1111 =
+b1111 J
+b111110 `
+b1111 a
+b1100 f
+b101 d
+b1111 c
+b11 e
+b11101 B
+15
+#290
+05
+#295
+b11110 B
+08
+15
+#300
+05
+#305
+b11111 B
+15
+#310
+05
+#315
+b1 V
+0&
+1(
+1@
+b10110 6
+b10110 F
+b101 7
+b101 G
+b1100 ?
+b1100 K
+b101 i
+b1100 h
+b100000 B
+15
+#320
+05
+#325
+b10 V
+1)
+b1100 *
+b1100 W
+b1100 ^
+b101 _
+0(
+b11 b
+b1 E
+b100001 B
+0@
+15
+#330
+05
+#335
+b11 V
+b11 ]
+0)
+b10 E
+b100010 B
+1:
+b11 9
+b11 H
+15
+#340
+05
+#345
+b100 V
+b1001011 "
+b1001011 \
+b1001011 #
+b1001011 [
+b1010000 $
+b1010000 Z
+b1010000 %
+b1010000 Y
+0j
+b0 D
+0:
+b11 E
+b100011 B
+15
+#350
+05
+#355
+b0 V
+1&
+1!
+b100 E
+b100100 B
+b1 D
+15
+#360
+05
+#365
+0!
+b11 C
+1j
+b100 D
+b0 E
+b100101 B
+15
+#370
+05
+#375
+b100110 B
+15
+#380
+05
+#385
+b100111 B
+15
+#390
+05
+#395
+b101000 B
+15
+#400
+05
+#405
+b101001 B
+15
+#410
+05
+#415
+b1110011 X
+18
+b1000001 <
+b1000001 I
+b100011 =
+b100011 J
+b1000001 `
+b100011 a
+b1111 f
+b111 d
+b100011 c
+b0 e
+b101010 B
+15
+#420
+05
+#425
+b101011 B
+08
+15
+#430
+05
+#435
+b101100 B
+15
+#440
+05
+#445
+b1 V
+0&
+1(
+1@
+b11001 6
+b11001 F
+b111 7
+b111 G
+b1111 ?
+b1111 K
+b111 i
+b1111 h
+b101101 B
+15
+#450
+05
+#455
+b10 V
+1)
+b1111 *
+b1111 W
+b1111 ^
+b111 _
+0(
+b0 b
+b1 E
+b101110 B
+0@
+15
+#460
+05
+#465
+b11 V
+b0 ]
+0)
+b10 E
+b101111 B
+1:
+b0 9
+b0 H
+15
+#470
+05
+#475
+b100 V
+b1101100 "
+b1101100 \
+b1101100 #
+b1101100 [
+b1101100 $
+b1101100 Z
+b1101100 %
+b1101100 Y
+0j
+b0 D
+0:
+b11 E
+b110000 B
+15
+#480
+05
+#485
+b0 V
+1&
+1!
+b100 E
+b110001 B
+b1 D
+15
+#490
+05
+#495
+0!
+b100 C
+1j
+b100 D
+b0 E
+b110010 B
+15
+#500
+05
+#505
+b110011 B
+15
+#510
+05
+#515
+b110100 B
+15
+#520
+05
+#525
+b110101 B
+15
+#530
+05
+#535
+b110110 B
+15
+#540
+05
+#545
+1A
+b110111 B
+15
+#550
+05
+#555
+b111000 B
+15
+#560
+05
+#565
+b111001 B
+15
+#570
+05
+#575
+b111010 B
+15
+#580
+05
+#585
+b111011 B
+15
+#590
+05
+#595
+b111100 B
+15
