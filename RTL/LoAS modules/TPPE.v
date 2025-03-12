@@ -14,7 +14,7 @@ module tppe #(
     // Input bitmasks and data
     input wire [BITMASK_WIDTH-1:0] bitmask_a,
     input wire [BITMASK_WIDTH-1:0] bitmask_b,
-    input wire [WEIGHT_WIDTH-1:0] nonzero_weights [0:BITMASK_WIDTH-1],
+    input wire [BITMASK_WIDTH*WEIGHT_WIDTH-1:0] nonzero_weights_flat, // Flattened array input
     input wire valid_input,
     
     // Memory interface for accessing fibre_a data
@@ -72,11 +72,12 @@ module tppe #(
         .and_result(and_result),
         .bitmask_b(bitmask_b),
         .valid_match(valid_input),
-        .fibre_b_data(nonzero_weights),
+        .fibre_b_data_flat(nonzero_weights_flat), // Pass flattened array
         .fast_offset(),  // Not connected - we don't need this at top level
         .matched_position(matched_position),
         .matched_weight(matched_weight),
-        .fast_valid(fast_valid)
+        .fast_valid(fast_valid),
+        .processing_done() // Add this output connection
     );
     
     // Laggy Prefix Module
