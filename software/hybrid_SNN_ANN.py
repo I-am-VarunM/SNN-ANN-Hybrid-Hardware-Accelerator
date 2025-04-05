@@ -1,448 +1,204 @@
-import math
 import numpy as np
-import matplotlib.pyplot as plt
+from tppe_simulator import TPPESimulator
+from TPPE_cluster import TPPEClusterSimulator
 from sparten_simulator import SparTenSimulator
+from sparten_cluster import SparTenClusterDynamic
+import matplotlib.pyplot as plt
 
-class SparTenClusterDynamic:
+class NeuroFlex:
     """
-    Simulator for a SparTen cluster with dynamic assignment of work
-    to compute units as they finish their current tasks
+    NeuroFlex: A framework for simulating both LoAS and SparTen neural network accelerators in parallel
+    
+    This class runs simulations on both hardware accelerator architectures simultaneously
+    and reports combined performance metrics.
     """
     
-    def __init__(self, num_compute_units=16):
-        # Cluster configuration
-        self.NUM_COMPUTE_UNITS = num_compute_units
-        self.CHUNK_SIZE = 128  # Elements per chunk
-        
-        # Create the compute units
-        self.compute_units = [SparTenSimulator() for _ in range(self.NUM_COMPUTE_UNITS)]
-        
-        # Scheduler power in mW
-        self.SCHEDULER_POWER = 0.132  # mW
-        
-        # Operating frequency in MHz
-        self.FREQ_MHZ = 560
-        
-        # Performance metrics
-        self.total_cycles = 0
-        self.total_energy_nj = 0
-        self.total_matches = 0
-        self.total_chunks = 0
-        self.total_rows = 0
-        self.partial_sums = []
-        self.cu_utilization = []  # Track utilization of each compute unit
-        self.pre_relu_sums = []
-        # Breakdown of energy consumption
-        self.energy_breakdown = {
-            "scheduler": 0,
-            "compute_units": 0,
-            "compute_unit_breakdown": {}
-        }
-        
-        # Detailed execution trace for visualization and debugging
-        self.execution_trace = []
-    
-    def run_simulation(self, filter_data, feature_data):
+    def __init__(self, num_compute_units=16, clock_freq_mhz=560):
         """
-        Run the SparTen cluster simulation with the given data, properly handling
-        scheduling cycles between operations.
+        Initialize the NeuroFlex simulator with both LoAS and SparTen clusters
         
         Parameters:
-        filter_data: Dictionary with "sparse_maps" and "values" (list of sparse maps and their values)
-        feature_data: Dictionary with "sparse_maps" and "values" (list of sparse maps and their values)
+        - num_compute_units: Number of compute units/TPPEs to simulate
+        - clock_freq_mhz: Clock frequency in MHz
         """
-        # Extract data
-        filter_sparse_maps = filter_data["sparse_maps"]
-        filter_values = filter_data["values"]
-        feature_sparse_maps = feature_data["sparse_maps"]
-        feature_values = feature_data["values"]
+        self.num_compute_units = num_compute_units
+        self.clock_freq_mhz = clock_freq_mhz
         
-        # Validate input
-        if len(filter_sparse_maps) != len(filter_values):
-            raise ValueError("Number of filter sparse maps must match number of filter value lists")
-        if len(feature_sparse_maps) != len(feature_values):
-            raise ValueError("Number of feature sparse maps must match number of feature value lists")
+        # Initialize both simulators
+        self.loas_simulator = TPPEClusterSimulator(num_compute_units, clock_freq_mhz)
+        self.sparten_simulator = SparTenClusterDynamic(num_compute_units)
         
-        # Calculate total number of rows to process
-        total_rows = len(filter_sparse_maps)
-        self.total_rows = total_rows
-        
-        # 1. Vector Analysis and Preparation
-        row_info = []
-        for i in range(total_rows):
-            # Calculate chunks needed
-            vector_length = len(filter_sparse_maps[i])
-            chunks_needed = math.ceil(vector_length / self.CHUNK_SIZE)
-            
-            # Count matches in each chunk
-            total_matches = 0
-            for j in range(chunks_needed):
-                start_idx = j * self.CHUNK_SIZE
-                end_idx = min(start_idx + self.CHUNK_SIZE, vector_length)
-                
-                # Count matches in this chunk
-                chunk_matches = sum(1 for k in range(start_idx, end_idx) 
-                                if filter_sparse_maps[i][k] and feature_sparse_maps[i][k])
-                total_matches += chunk_matches
-            
-            row_info.append({
-                "row_idx": i,
-                "chunks_needed": chunks_needed,
-                "total_matches": total_matches,
-                "vector_length": vector_length
-            })
-        
-        # Sort rows by total matches (highest first)
-        row_info.sort(key=lambda x: x["total_matches"], reverse=True)
-        
-        # Initialize simulation state
-        current_cycle = 0
-        self.total_cycles = 0
-        self.total_energy_nj = 0
-        self.total_matches = 0
-        self.total_chunks = 0
-        self.partial_sums = [0] * total_rows
-        self.pre_relu_sums = [0] * total_rows
-        self.cu_utilization = [0] * self.NUM_COMPUTE_UNITS
-        self.execution_trace = []
-        
-        # Initialize compute unit state tracking
-        cu_state = []
-        for i in range(self.NUM_COMPUTE_UNITS):
-            cu_state.append({
-                "busy_until": 0,          # When this CU will finish current task
-                "current_row": None,      # Which row is being processed
-                "current_chunk": 0,       # Which chunk is being processed
-                "total_chunks": 0,        # Total chunks for current row
-                "processing_phase": None, # "scheduling", "computing", "relu"
-                "accumulated_sum": 0,     # Running sum for current row
-                "total_active_cycles": 0  # For utilization calculation
-            })
-        
-        # Row assignment queue
-        row_queue = [info["row_idx"] for info in row_info]
-        rows_completed = 0
-        scheduler_energy = 0
-        
-        # Initialize event queue for simulation
-        # Events are (cycle, cu_idx, event_type) tuples
-        event_queue = []
-        
-        # Initial assignment of rows to compute units
-        for cu_idx in range(min(self.NUM_COMPUTE_UNITS, len(row_queue))):
-            if row_queue:
-                row_idx = row_queue.pop(0)
-                
-                # Calculate row info
-                chunks_needed = math.ceil(len(filter_sparse_maps[row_idx]) / self.CHUNK_SIZE)
-                self.total_chunks += chunks_needed
-                
-                # Schedule first chunk (takes 1 cycle)
-                cu_state[cu_idx]["current_row"] = row_idx
-                cu_state[cu_idx]["current_chunk"] = 0
-                cu_state[cu_idx]["total_chunks"] = chunks_needed
-                cu_state[cu_idx]["processing_phase"] = "scheduling"
-                cu_state[cu_idx]["busy_until"] = current_cycle + 1  # Scheduling takes 1 cycle
-                
-                # Add event for scheduling completion
-                event_queue.append((current_cycle + 1, cu_idx, "chunk_scheduled"))
-                
-                # Track scheduler energy
-                scheduler_energy += self.SCHEDULER_POWER / self.FREQ_MHZ
-                
-                # Log event
-                self.execution_trace.append({
-                    "cycle": current_cycle,
-                    "event": f"Scheduling row {row_idx} chunk 0 to CU {cu_idx}",
-                    "details": {
-                        "total_chunks": chunks_needed
-                    }
-                })
-        
-        # Main simulation loop
-        while rows_completed < total_rows:
-            # No events in queue would mean we're stuck
-            if not event_queue:
-                break
-            
-            # Sort events by cycle
-            event_queue.sort(key=lambda x: x[0])
-            
-            # Get next event
-            next_cycle, cu_idx, event_type = event_queue.pop(0)
-            
-            # Advance simulation time
-            current_cycle = next_cycle
-            
-            # Process the event
-            if event_type == "chunk_scheduled":
-                # Chunk has been scheduled, start computation
-                row_idx = cu_state[cu_idx]["current_row"]
-                chunk_idx = cu_state[cu_idx]["current_chunk"]
-                
-                # Calculate start and end indices for this chunk
-                vector_length = len(filter_sparse_maps[row_idx])
-                start_idx = chunk_idx * self.CHUNK_SIZE
-                end_idx = min(start_idx + self.CHUNK_SIZE, vector_length)
-                
-                # Create chunk-specific data
-                chunk_filter_map = filter_sparse_maps[row_idx][start_idx:end_idx]
-                chunk_feature_map = feature_sparse_maps[row_idx][start_idx:end_idx]
-                
-                # Count matches in this chunk
-                matches = sum(1 for k in range(len(chunk_filter_map)) 
-                            if chunk_filter_map[k] and chunk_feature_map[k])
-                
-                # Calculate computation time: 4 + (matches - 1)
-                compute_cycles = 4 + max(0, matches - 1) if matches > 0 else 1
-                
-                # Update state
-                cu_state[cu_idx]["processing_phase"] = "computing"
-                cu_state[cu_idx]["busy_until"] = current_cycle + compute_cycles
-                
-                # Track active cycles
-                cu_state[cu_idx]["total_active_cycles"] += compute_cycles
-                
-                # Schedule completion event
-                event_queue.append((current_cycle + compute_cycles, cu_idx, "chunk_computed"))
-                
-                # Compute energy and update metrics
-                chip_energy = 11.010 * matches * 1/560  # We would calculate this based on component activity
-                self.total_energy_nj += chip_energy
-                self.total_matches += matches
-                
-                # Log event
-                self.execution_trace.append({
-                    "cycle": current_cycle,
-                    "event": f"CU {cu_idx} computing row {row_idx} chunk {chunk_idx}",
-                    "details": {
-                        "matches": matches,
-                        "compute_cycles": compute_cycles,
-                        "completion_cycle": current_cycle + compute_cycles
-                    }
-                })
-                
-            elif event_type == "chunk_computed":
-                # Chunk computation complete
-                row_idx = cu_state[cu_idx]["current_row"]
-                chunk_idx = cu_state[cu_idx]["current_chunk"]
-                
-                # Calculate chunk contribution to sum
-                # (In a real simulation, this would come from the simulator)
-                vector_length = len(filter_sparse_maps[row_idx])
-                start_idx = chunk_idx * self.CHUNK_SIZE
-                end_idx = min(start_idx + self.CHUNK_SIZE, vector_length)
-                
-                # Extract values based on filter and feature maps
-                chunk_filter_map = filter_sparse_maps[row_idx][start_idx:end_idx]
-                chunk_feature_map = feature_sparse_maps[row_idx][start_idx:end_idx]
-                
-                # Find matches
-                matches = []
-                for i in range(len(chunk_filter_map)):
-                    if chunk_filter_map[i] and chunk_feature_map[i]:
-                        # Find position in original sparse maps
-                        filter_pos = sum(1 for j in range(start_idx + i) if filter_sparse_maps[row_idx][j])
-                        feature_pos = sum(1 for j in range(start_idx + i) if feature_sparse_maps[row_idx][j])
-                        
-                        if filter_pos <= len(filter_values[row_idx]) and feature_pos <= len(feature_values[row_idx]):
-                            filter_val = filter_values[row_idx][filter_pos-1]
-                            feature_val = feature_values[row_idx][feature_pos-1]
-                            matches.append(filter_val * feature_val)
-                
-                # Update accumulated sum
-                chunk_sum = sum(matches)
-                cu_state[cu_idx]["accumulated_sum"] += chunk_sum
-                
-                # Check if more chunks remain
-                if chunk_idx + 1 < cu_state[cu_idx]["total_chunks"]:
-                    # Schedule next chunk (takes 1 cycle)
-                    cu_state[cu_idx]["current_chunk"] += 1
-                    cu_state[cu_idx]["processing_phase"] = "scheduling"
-                    cu_state[cu_idx]["busy_until"] = current_cycle + 1
-                    
-                    # Add event for scheduling completion
-                    event_queue.append((current_cycle + 1, cu_idx, "chunk_scheduled"))
-                    
-                    # Track scheduler energy
-                    scheduler_energy += self.SCHEDULER_POWER / self.FREQ_MHZ
-                    
-                    # Log event
-                    self.execution_trace.append({
-                        "cycle": current_cycle,
-                        "event": f"Scheduling row {row_idx} chunk {chunk_idx+1} to CU {cu_idx}",
-                        "details": {
-                            "accumulated_sum": cu_state[cu_idx]["accumulated_sum"]
-                        }
-                    })
-                else:
-                    # All chunks processed, schedule ReLU (takes 1 cycle)
-                    cu_state[cu_idx]["processing_phase"] = "relu"
-                    cu_state[cu_idx]["busy_until"] = current_cycle + 1
-                    
-                    # Add event for ReLU completion
-                    event_queue.append((current_cycle + 1, cu_idx, "relu_completed"))
-                    
-                    # Log event
-                    self.execution_trace.append({
-                        "cycle": current_cycle,
-                        "event": f"CU {cu_idx} performing ReLU for row {row_idx}",
-                        "details": {
-                            "pre_relu_sum": cu_state[cu_idx]["accumulated_sum"]
-                        }
-                    })
-            
-            elif event_type == "relu_completed":
-                # ReLU computation complete
-                row_idx = cu_state[cu_idx]["current_row"]
-                
-                # Apply ReLU function
-                pre_relu_sum = cu_state[cu_idx]["accumulated_sum"]
-                post_relu_sum = max(0, pre_relu_sum)
-                
-                # Store results
-                self.pre_relu_sums[row_idx] = pre_relu_sum
-                self.partial_sums[row_idx] = post_relu_sum
-                
-                # Mark row as completed
-                rows_completed += 1
-                
-                # Log event
-                self.execution_trace.append({
-                    "cycle": current_cycle,
-                    "event": f"CU {cu_idx} completed row {row_idx}",
-                    "details": {
-                        "pre_relu_sum": pre_relu_sum,
-                        "post_relu_sum": post_relu_sum
-                    }
-                })
-                
-                # Check if more rows are available
-                if row_queue:
-                    # Schedule next row (takes 1 cycle)
-                    new_row_idx = row_queue.pop(0)
-                    
-                    # Reset compute unit state for new row
-                    chunks_needed = math.ceil(len(filter_sparse_maps[new_row_idx]) / self.CHUNK_SIZE)
-                    self.total_chunks += chunks_needed
-                    
-                    cu_state[cu_idx]["current_row"] = new_row_idx
-                    cu_state[cu_idx]["current_chunk"] = 0
-                    cu_state[cu_idx]["total_chunks"] = chunks_needed
-                    cu_state[cu_idx]["processing_phase"] = "scheduling"
-                    cu_state[cu_idx]["busy_until"] = current_cycle + 1
-                    cu_state[cu_idx]["accumulated_sum"] = 0
-                    
-                    # Add event for scheduling completion
-                    event_queue.append((current_cycle + 1, cu_idx, "chunk_scheduled"))
-                    
-                    # Track scheduler energy
-                    scheduler_energy += self.SCHEDULER_POWER / self.FREQ_MHZ
-                    
-                    # Log event
-                    self.execution_trace.append({
-                        "cycle": current_cycle,
-                        "event": f"Scheduling row {new_row_idx} chunk 0 to CU {cu_idx}",
-                        "details": {
-                            "total_chunks": chunks_needed
-                        }
-                    })
-                else:
-                    # No more rows, mark compute unit as idle
-                    cu_state[cu_idx]["current_row"] = None
-                    cu_state[cu_idx]["processing_phase"] = None
-        
-        # Update final metrics
-        self.total_cycles = current_cycle
-        self.energy_breakdown["scheduler"] = scheduler_energy
-        self.energy_breakdown["compute_units"] = self.total_energy_nj
-        self.total_energy_nj += scheduler_energy
-        
-        # Calculate compute unit utilization
-        for cu_idx in range(self.NUM_COMPUTE_UNITS):
-            self.cu_utilization[cu_idx] = cu_state[cu_idx]["total_active_cycles"] / max(1, self.total_cycles)
-        
-        # Return a report of the simulation results
-        return self.generate_report()
+        # Results storage
+        self.loas_results = None
+        self.sparten_results = None
+        self.combined_results = None
     
-    def generate_report(self):
-        """Generate a report of the simulation results"""
-        report = {
-            "total_cycles": self.total_cycles,
-            "total_energy_nj": self.total_energy_nj,
-            "energy_per_operation_nj": self.total_energy_nj / max(1, self.total_matches),
-            "total_matches": self.total_matches,
-            "total_chunks": self.total_chunks,
-            "total_rows": self.total_rows,
-            "rows_per_cycle": self.total_rows / max(1, self.total_cycles),
-            "operations_per_cycle": self.total_matches / max(1, self.total_cycles),
-            "partial_sums": self.partial_sums,
-            "pre_relu" : self.pre_relu_sums,
-            "cu_utilization": self.cu_utilization,
-            "average_utilization": sum(self.cu_utilization) / max(1, len(self.cu_utilization)),
-            "energy_breakdown": self.energy_breakdown,
-            "execution_trace": self.execution_trace
+    def run_simulation(self, loas_data, sparten_data):
+        """
+        Run simulation on both accelerators in parallel
+        
+        Parameters:
+        - loas_data: A tuple of (activations_batch, weights_batch, thresholds) for LoAS
+        - sparten_data: A tuple of (filter_data, feature_data) for SparTen
+        
+        Returns:
+        - Combined simulation results
+        """
+        # Run LoAS simulation
+        activations_batch, weights_batch, thresholds = loas_data
+        print(f"Running LoAS simulation with {len(activations_batch)} vectors...")
+        self.loas_results = self.loas_simulator.simulate(activations_batch, weights_batch, thresholds)
+        
+        # Run SparTen simulation
+        filter_data, feature_data = sparten_data
+        print(f"Running SparTen simulation with {len(filter_data['sparse_maps'])} rows...")
+        self.sparten_results = self.sparten_simulator.run_simulation(filter_data, feature_data)
+        
+        # Combine results
+        self.combined_results = self._combine_results()
+        
+        return self.combined_results
+    
+    def _combine_results(self):
+        """Combine results from both simulators"""
+        if self.loas_results is None or self.sparten_results is None:
+            raise ValueError("Both simulations must be run before combining results")
+        
+        # Get total cycles (max of both)
+        loas_cycles = self.loas_results["Total Cycles"]
+        sparten_cycles = self.sparten_results["total_cycles"]
+        total_cycles = max(loas_cycles, sparten_cycles)
+        
+        # Get total energy (sum of both)
+        loas_energy = self.loas_results["Energy Metrics"]["Total Cluster Energy (nJ)"]
+        sparten_energy = self.sparten_results["total_energy_nj"]
+        total_energy = loas_energy + sparten_energy
+        
+        # Calculate utilization for LoAS
+        loas_active_cycles = self.loas_results["TPPE Active Cycles"]
+        loas_util = sum(loas_active_cycles) / (self.num_compute_units * loas_cycles) if loas_cycles > 0 else 0
+        
+        # Get SparTen utilization
+        sparten_util = self.sparten_results["average_utilization"]
+        
+        return {
+            "Total Cycles": total_cycles,
+            "Total Energy (nJ)": total_energy,
+            "LoAS Cycles": loas_cycles,
+            "SparTen Cycles": sparten_cycles,
+            "LoAS Energy (nJ)": loas_energy,
+            "SparTen Energy (nJ)": sparten_energy,
+            "LoAS Utilization": loas_util,
+            "SparTen Utilization": sparten_util,
+            "LoAS Results": self.loas_results,
+            "SparTen Results": self.sparten_results
         }
-        return report
     
-    def print_summary(self, report=None):
-        """Print a summary of the simulation results"""
-        if report is None:
-            report = self.generate_report()
-        
-        print("\n=== SparTen Cluster Dynamic Simulation Summary ===")
-        print(f"Total rows processed: {report['total_rows']}")
-        print(f"Total chunks processed: {report['total_chunks']}")
-        print(f"Total matches found: {report['total_matches']}")
-        print(f"Total cycles: {report['total_cycles']}")
-        print(f"Rows per cycle: {report['rows_per_cycle']:.2f}")
-        print(f"Operations per cycle: {report['operations_per_cycle']:.2f}")
-        print(f"Average compute unit utilization: {report['average_utilization']*100:.1f}%")
-        
-        # Print individual compute unit utilization
-        print("\nCompute unit utilization:")
-        for i, util in enumerate(report['cu_utilization']):
-            print(f"  CU {i}: {util*100:.1f}%")
-        
-        # Print individual partial sums
-        print("\nPartial sums for each row:")
-        for i, partial_sum in enumerate(report['partial_sums']):
-            print(f"  Row {i}: {partial_sum}")
-        
-        # Print summary statistics for partial sums
-        # sums = report['partial_sums']
-        # if sums:
-        #     print(f"\nPartial sums summary statistics:")
-        #     print(f"  Average: {sum(sums)/len(sums):.2f}")
-        #     print(f"  Minimum: {min(sums)}")
-        #     print(f"  Maximum: {max(sums)}")
-        #     print(f"  Total: {sum(sums)}")
-        
-        print(f"\nTotal energy consumption: {report['total_energy_nj']:.2f} nJ")
-        print(f"Energy per operation: {report['energy_per_operation_nj']:.2f} nJ")
-        
-        # Scheduler vs. compute units energy
-        scheduler_energy = report['energy_breakdown']['scheduler']
-        compute_energy = report['energy_breakdown']['compute_units']
-        
-        print("\nEnergy breakdown:")
-        print(f"  Scheduler: {scheduler_energy:.2f} nJ ({scheduler_energy/report['total_energy_nj']*100:.1f}%)")
-        print(f"  Compute Units: {compute_energy:.2f} nJ ({compute_energy/report['total_energy_nj']*100:.1f}%)")
-        print("================================================\n")
-    
-    def visualize_execution(self, report=None):
-        """Visualize the execution timeline with proper scheduling cycles and phases"""
-        if report is None:
-            report = self.generate_report()
-        
-        trace = report['execution_trace']
-        if not trace:
-            print("No execution trace available for visualization.")
+    def print_summary(self):
+        """Print a summary of the combined simulation results"""
+        if self.combined_results is None:
+            print("No simulation results available. Run a simulation first.")
             return
         
-        # Extract event information and track state changes
+        print("\n=== NeuroFlex Simulation Summary ===")
+        print(f"Total Cycles: {self.combined_results['Total Cycles']}")
+        print(f"Total Energy: {self.combined_results['Total Energy (nJ)']:.4f} nJ")
+        
+        print("\nLoAS Performance:")
+        print(f"  Cycles: {self.combined_results['LoAS Cycles']}")
+        print(f"  Energy: {self.combined_results['LoAS Energy (nJ)']:.4f} nJ")
+        print(f"  Utilization: {self.combined_results['LoAS Utilization']*100:.2f}%")
+        
+        print("\nSparTen Performance:")
+        print(f"  Cycles: {self.combined_results['SparTen Cycles']}")
+        print(f"  Energy: {self.combined_results['SparTen Energy (nJ)']:.4f} nJ")
+        print(f"  Utilization: {self.combined_results['SparTen Utilization']*100:.2f}%")
+        
+        # Critical path analysis
+        critical_path = "LoAS" if self.combined_results['LoAS Cycles'] >= self.combined_results['SparTen Cycles'] else "SparTen"
+        print(f"\nCritical Path: {critical_path} (determining total cycle count)")
+        
+        print("======================================")
+    
+    def visualize_execution(self):
+        """Visualize the execution timeline of both simulations"""
+        if self.loas_results is None or self.sparten_results is None:
+            print("No simulation results available. Run a simulation first.")
+            return
+        
+        # Visualize LoAS execution
+        print("\n=== LoAS Execution Visualization ===")
+        self.loas_simulator.plot_gantt_chart(
+            self.loas_results['TPPE Timeline'],
+            [{"id": i, "matches": result["Matches"]} for i, result in enumerate(self.loas_results['TPPE Results'])]
+        )
+        
+        # Visualize SparTen execution
+        print("\n=== SparTen Execution Visualization ===")
+        self.sparten_simulator.visualize_execution(self.sparten_results)
+    
+    def plot_comparison(self):
+        """Create a comparative visualization of LoAS vs SparTen performance"""
+        if self.combined_results is None:
+            print("No simulation results available. Run a simulation first.")
+            return
+        
+        # Create comparison bar charts
+        fig, axs = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # Plot cycles comparison
+        accelerators = ['LoAS', 'SparTen', 'Combined']
+        cycles = [
+            self.combined_results['LoAS Cycles'],
+            self.combined_results['SparTen Cycles'],
+            self.combined_results['Total Cycles']
+        ]
+        
+        axs[0].bar(accelerators, cycles, color=['blue', 'orange', 'green'])
+        axs[0].set_title('Execution Cycles Comparison')
+        axs[0].set_ylabel('Cycles')
+        axs[0].grid(axis='y', alpha=0.3)
+        
+        # Plot energy comparison
+        energy = [
+            self.combined_results['LoAS Energy (nJ)'],
+            self.combined_results['SparTen Energy (nJ)'],
+            self.combined_results['Total Energy (nJ)']
+        ]
+        
+        axs[1].bar(accelerators, energy, color=['blue', 'orange', 'green'])
+        axs[1].set_title('Energy Consumption Comparison')
+        axs[1].set_ylabel('Energy (nJ)')
+        axs[1].grid(axis='y', alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+
+    def visualize_combined_execution(self):
+        """
+        Visualize both LoAS and SparTen execution timelines on the same chart
+        to directly compare their parallel execution.
+        """
+        if self.combined_results is None:
+            print("No simulation results available. Run a simulation first.")
+            return
+        
+        # Create a large figure to accommodate both accelerators
+        plt.figure(figsize=(18, 12))
+        
+        # Get timeline data
+        loas_timeline = self.loas_results['TPPE Timeline']
+        sparten_timeline = self.sparten_results['execution_trace']
+        
+        # Determine max cycle for proper x-axis scaling
+        max_cycle = max(
+            self.combined_results['LoAS Cycles'],
+            self.combined_results['SparTen Cycles']
+        )
+        
+        # Parse SparTen timeline to extract activities
         cu_activity = {}
-        for event in trace:
+        for event in sparten_timeline:
             cycle = event['cycle']
             event_desc = event['event']
             
@@ -510,27 +266,76 @@ class SparTenClusterDynamic:
                     'color': 'firebrick'
                 })
         
-        # Create Gantt chart visualization
-        plt.figure(figsize=(16, 10))
+        # Create vector info for LoAS visualization from results
+        vector_info = [{"id": i, "matches": result["Matches"]} 
+                    for i, result in enumerate(self.loas_results['TPPE Results'])]
         
-        # Create a colormap for rows
-        row_colors = plt.cm.viridis(np.linspace(0, 1, report['total_rows']))
+        # Set up number of rows in the gantt chart
+        total_rows = self.num_compute_units * 2  # TPPEs + CUs
+        y_ticks = []
+        y_labels = []
         
-        # Phase-specific colors
-        phase_colors = {
+        # Create a subplot
+        ax = plt.gca()
+        
+        # Define colors for different phases
+        loas_colors = plt.cm.viridis(np.linspace(0, 1, len(vector_info)))
+        sparten_phase_colors = {
             'scheduling': 'lightgrey',
             'computing': 'cornflowerblue',
             'relu': 'firebrick'
         }
         
-        # Plot compute unit activity
-        y_ticks = []
-        y_labels = []
+        # Group LoAS timeline entries by vector and TPPE
+        loas_segments = {}
+        for tppe_id, vector_id, start, end, is_chunk in loas_timeline:
+            key = (tppe_id, vector_id)
+            if key not in loas_segments:
+                loas_segments[key] = []
+            loas_segments[key].append((start, end, is_chunk))
         
-        for cu_idx, activities in sorted(cu_activity.items()):
-            y_pos = cu_idx
+        # Plot LoAS activities (first half of the chart)
+        for tppe_id in range(self.num_compute_units):
+            y_pos = tppe_id
             y_ticks.append(y_pos)
-            y_labels.append(f"CU {cu_idx}")
+            y_labels.append(f"LoAS TPPE {tppe_id}")
+            
+            # Plot TPPE activities
+            for (tppe_id_seg, vector_id), segments in loas_segments.items():
+                if tppe_id_seg == tppe_id:
+                    # Sort segments by start time
+                    segments.sort(key=lambda x: x[0])
+                    
+                    for i, (start, end, is_chunk) in enumerate(segments):
+                        width = end - start
+                        color = loas_colors[vector_id % len(loas_colors)]
+                        
+                        # Use different patterns for chunks vs LIF
+                        if is_chunk:
+                            # Chunk segments - solid fill
+                            rect = plt.Rectangle((start, y_pos - 0.4), width, 0.8, 
+                                            facecolor=color, edgecolor='black', alpha=0.7)
+                        else:
+                            # LIF segment - hatched pattern
+                            rect = plt.Rectangle((start, y_pos - 0.4), width, 0.8, 
+                                            facecolor=color, edgecolor='black', 
+                                            hatch='////', alpha=0.7)
+                        
+                        ax.add_patch(rect)
+                        
+                        # Only add a label on the first segment of each vector
+                        if i == 0:
+                            label_x = start + 0.5
+                            label_y = y_pos
+                            plt.text(label_x, label_y, f"V{vector_id}", 
+                                    ha='center', va='center', color='white', 
+                                    fontweight='bold', fontsize=7)
+        
+        # Plot SparTen activities (second half of the chart)
+        for cu_idx, activities in sorted(cu_activity.items()):
+            y_pos = self.num_compute_units + cu_idx  # Offset to place after TPPEs
+            y_ticks.append(y_pos)
+            y_labels.append(f"SparTen CU {cu_idx}")
             
             for activity in activities:
                 duration = activity['end'] - activity['start']
@@ -539,11 +344,12 @@ class SparTenClusterDynamic:
                 color = activity['color']
                 
                 # Add activity bar
-                plt.barh(y_pos, duration, left=activity['start'], color=color, 
-                        alpha=0.8, edgecolor='black')
+                rect = plt.Rectangle((activity['start'], y_pos - 0.4), duration, 0.8, 
+                                facecolor=color, edgecolor='black', alpha=0.7)
+                ax.add_patch(rect)
                 
                 # Add label if bar is wide enough
-                if duration > report['total_cycles'] * 0.03:
+                if duration > max_cycle * 0.02:
                     if activity['phase'] == 'computing':
                         label = f"R{activity['row']}C{activity.get('chunk', '')}"
                     elif activity['phase'] == 'relu':
@@ -552,71 +358,118 @@ class SparTenClusterDynamic:
                         label = f"Sched"
                     
                     plt.text(activity['start'] + duration/2, y_pos, label, 
-                            ha='center', va='center', fontsize=8, 
+                            ha='center', va='center', fontsize=7, 
                             color='black', fontweight='bold')
         
-        # Add legend for phases
-        legend_elements = [
-            plt.Rectangle((0,0), 1, 1, facecolor='lightgrey', edgecolor='black', alpha=0.8, label='Scheduling'),
-            plt.Rectangle((0,0), 1, 1, facecolor='cornflowerblue', edgecolor='black', alpha=0.8, label='Computing'),
-            plt.Rectangle((0,0), 1, 1, facecolor='firebrick', edgecolor='black', alpha=0.8, label='ReLU')
-        ]
+        # Add legends
+        loas_chunk_patch = plt.Rectangle((0, 0), 1, 1, facecolor='gray', alpha=0.7)
+        loas_lif_patch = plt.Rectangle((0, 0), 1, 1, facecolor='gray', hatch='////', alpha=0.7)
         
-        plt.legend(handles=legend_elements, loc='upper right')
+        sparten_sched_patch = plt.Rectangle((0, 0), 1, 1, facecolor='lightgrey', alpha=0.7)
+        sparten_comp_patch = plt.Rectangle((0, 0), 1, 1, facecolor='cornflowerblue', alpha=0.7)
+        sparten_relu_patch = plt.Rectangle((0, 0), 1, 1, facecolor='firebrick', alpha=0.7)
+        
+        plt.legend([loas_chunk_patch, loas_lif_patch, sparten_sched_patch, sparten_comp_patch, sparten_relu_patch], 
+                ['LoAS Computation', 'LoAS LIF', 'SparTen Scheduling', 'SparTen Computing', 'SparTen ReLU'], 
+                loc='upper right')
+        
+        # Add separator line between LoAS and SparTen sections
+        plt.axhline(y=self.num_compute_units - 0.5, color='black', linestyle='--', alpha=0.5)
+        
+        # Add critical path line
+        critical_path_cycle = self.combined_results['Total Cycles']
+        plt.axvline(x=critical_path_cycle, color='red', linestyle='--', alpha=0.7, 
+                label=f'Critical Path ({critical_path_cycle} cycles)')
         
         # Set chart properties
         plt.yticks(y_ticks, y_labels)
-        plt.xlabel('Cycle')
-        plt.ylabel('Compute Unit')
-        plt.title('SparTen Cluster Execution Timeline with Scheduling Phases')
+        plt.xlabel('Cycles')
+        plt.title('NeuroFlex: Combined LoAS and SparTen Execution Timeline')
         plt.grid(axis='x', alpha=0.3)
         
         # Add cycle markers at regular intervals
-        max_cycle = report['total_cycles']
         cycle_interval = max(1, max_cycle // 20)
         plt.xticks(range(0, max_cycle + cycle_interval, cycle_interval))
         
-        plt.tight_layout()
-        plt.show()
+        # Ensure x-axis extends to the max cycle
+        plt.xlim(-1, max_cycle + 1)
         
-        # Create utilization visualization
-        plt.figure(figsize=(12, 6))
-        
-        cu_indices = range(self.NUM_COMPUTE_UNITS)
-        utilization = report['cu_utilization']
-        
-        plt.bar(cu_indices, utilization)
-        plt.axhline(report['average_utilization'], color='r', linestyle='--', 
-                    label=f"Average: {report['average_utilization']*100:.1f}%")
-        
-        plt.xlabel('Compute Unit')
-        plt.ylabel('Utilization')
-        plt.title('Compute Unit Utilization')
-        plt.xticks(cu_indices, [f"CU {i}" for i in cu_indices])
-        plt.ylim(0, 1.1)
-        plt.grid(axis='y', alpha=0.3)
-        plt.legend()
+        # Adjust the y-axis limits to show all units with some padding
+        plt.ylim(bottom=-1, top=total_rows)
         
         plt.tight_layout()
         plt.show()
 
-# Create a simple debugging test case where different rows have very different match counts
-def create_debug_test_data():
+
+# Test data generation functions
+def generate_loas_test_data(num_vectors=40, vector_size=256, timesteps=4):
     """
-    Create a test case with rows of varying complexity:
-    - Some rows with many matches (heavy rows)
-    - Some rows with few matches (light rows)
+    Generate test data for LoAS simulator based on the provided pattern
     """
-    rows = 20  # Total number of rows
-    elements = 256  # Elements per row
+    activations_batch = []
+    weights_batch = []
+    thresholds = []
     
+    test_vectors = []
+    for i in range(num_vectors):
+        # Create test vector description with varied matches
+        if i % 5 == 0:  # Very dense
+            matches = 25 + np.random.randint(0, 6)  # 25-30 matches
+        elif i % 5 == 1:  # Dense
+            matches = 20 + np.random.randint(0, 6)  # 20-25 matches
+        elif i % 5 == 2:  # Medium
+            matches = 15 + np.random.randint(0, 6)  # 15-20 matches
+        elif i % 5 == 3:  # Sparse
+            matches = 10 + np.random.randint(0, 6)  # 10-15 matches
+        else:  # Very sparse
+            matches = 5 + np.random.randint(0, 6)   # 5-10 matches
+        
+        test_vectors.append({
+            "size": vector_size,
+            "matches": matches,
+            "id": i
+        })
+    
+    for vector in test_vectors:
+        size = vector["size"]
+        matches = vector["matches"]
+        
+        # Create activation matrix with exactly 'matches' non-zero positions
+        activations = np.zeros((timesteps, size), dtype=int)
+        
+        # Distribute matches across the activation matrix
+        match_positions = np.random.choice(size, matches, replace=False)
+        for pos in match_positions:
+            # Create a pattern of 1s (can be different for each position)
+            pattern = np.random.randint(0, 2, size=timesteps)
+            # Ensure at least one 1 in the pattern
+            if np.sum(pattern) == 0:
+                pattern[np.random.randint(0, timesteps)] = 1
+            activations[:, pos] = pattern
+        
+        # Create weights for this vector
+        weights = np.random.randint(1, 11, size=size)
+        
+        # Set threshold
+        threshold = 15
+        
+        activations_batch.append(activations)
+        weights_batch.append(weights)
+        thresholds.append(threshold)
+    
+    return activations_batch, weights_batch, thresholds
+
+def generate_sparten_test_data(num_rows=40, elements=256):
+    """
+    Generate test data for SparTen simulator based on the provided pattern
+    """
     filter_sparse_maps = []
     filter_values = []
     feature_sparse_maps = []
     feature_values = []
     
     # Create rows with varying density
-    for i in range(rows):
+    for i in range(num_rows):
         # Vary density based on row index
         if i % 5 == 0:  # 20% of rows are very dense
             density = 0.8
@@ -663,29 +516,41 @@ def create_debug_test_data():
         }
     }
 
-def run_dynamic_cluster_test():
-    """Run a test of the SparTen dynamic cluster simulator"""
-    print("=== SparTen Dynamic Cluster Test ===")
+
+def run_neuroflex_test():
+    """Run a test of the NeuroFlex simulator with both accelerators"""
+    print("=== NeuroFlex Test ===")
     
-    # Create a cluster
-    cluster = SparTenClusterDynamic(num_compute_units=16)
+    # Create a NeuroFlex instance
+    neuroflex = NeuroFlex(num_compute_units=16)
     
-    # Create debug test data
-    test_data = create_debug_test_data()
+    # Generate test data for LoAS and SparTen
+    print("Generating test data...")
+    loas_data = generate_loas_test_data(num_vectors=40)
+    sparten_data_dict = generate_sparten_test_data(num_rows=40)
     
-    filter_data = test_data["filter_data"]
-    feature_data = test_data["feature_data"]
+    # Extract SparTen data
+    sparten_data = (
+        sparten_data_dict["filter_data"],
+        sparten_data_dict["feature_data"]
+    )
     
     # Run simulation
-    report = cluster.run_simulation(filter_data, feature_data)
+    print("Running parallel simulation...")
+    results = neuroflex.run_simulation(loas_data, sparten_data)
     
     # Print summary
-    cluster.print_summary(report)
+    neuroflex.print_summary()
     
-    # Visualize execution
-    cluster.visualize_execution(report)
+    # Generate comparison plot
+    neuroflex.plot_comparison()
     
-    return cluster, report
+    # Visualize execution (optional, can be commented out if not needed)
+    neuroflex.visualize_execution()
+
+    neuroflex.visualize_combined_execution()
+    
+    return neuroflex, results
 
 if __name__ == "__main__":
-    cluster, report = run_dynamic_cluster_test()
+    neuroflex, results = run_neuroflex_test()
