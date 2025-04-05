@@ -1,888 +1,691 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import math
 import numpy as np
-from typing import List, Tuple, Dict, Optional, Union
-from collections import OrderedDict
+import matplotlib.pyplot as plt
+from sparten_simulator import SparTenSimulator
 
-class ANNtoSNNConverter(nn.Module):
+class SparTenClusterDynamic:
     """
-    Converts ANN activations to SNN spike trains
-    Corresponds to the ann_to_snn_converter Verilog module
-    With optional 8-bit quantization
+    Simulator for a SparTen cluster with dynamic assignment of work
+    to compute units as they finish their current tasks
     """
-    def __init__(self, time_steps=4, threshold=1.0, quantize=False, scale_factor=1.0):
-        """
-        Args:
-            time_steps: Number of time steps to simulate
-            threshold: Membrane potential threshold for spiking
-            quantize: Whether to quantize to int8
-            scale_factor: Scale factor for quantization
-        """
-        super(ANNtoSNNConverter, self).__init__()
-        self.time_steps = time_steps
-        self.threshold = threshold
-        self.quantize = quantize
-        self.scale_factor = scale_factor
-        self.reset()
+    
+    def __init__(self, num_compute_units=16):
+        # Cluster configuration
+        self.NUM_COMPUTE_UNITS = num_compute_units
+        self.CHUNK_SIZE = 128  # Elements per chunk
         
-    def reset(self):
-        """Reset internal state"""
-        # Initialize membrane potential to half the threshold (as in Verilog)
-        self.membrane = None
-        self.spikes = None
-        self.t_counter = 0
+        # Create the compute units
+        self.compute_units = [SparTenSimulator() for _ in range(self.NUM_COMPUTE_UNITS)]
         
-    def quantize_to_int8(self, x):
+        # Scheduler power in mW
+        self.SCHEDULER_POWER = 0.132  # mW
+        
+        # Operating frequency in MHz
+        self.FREQ_MHZ = 560
+        
+        # Performance metrics
+        self.total_cycles = 0
+        self.total_energy_nj = 0
+        self.total_matches = 0
+        self.total_chunks = 0
+        self.total_rows = 0
+        self.partial_sums = []
+        self.cu_utilization = []  # Track utilization of each compute unit
+        self.pre_relu_sums = []
+        # Breakdown of energy consumption
+        self.energy_breakdown = {
+            "scheduler": 0,
+            "compute_units": 0,
+            "compute_unit_breakdown": {}
+        }
+        
+        # Detailed execution trace for visualization and debugging
+        self.execution_trace = []
+    
+    def run_simulation(self, filter_data, feature_data):
         """
-        Quantize values to int8 range (-128 to 127)
+        Run the SparTen cluster simulation with the given data, properly handling
+        scheduling cycles between operations.
+        
+        Parameters:
+        filter_data: Dictionary with "sparse_maps" and "values" (list of sparse maps and their values)
+        feature_data: Dictionary with "sparse_maps" and "values" (list of sparse maps and their values)
         """
-        if not self.quantize:
-            return x
+        # Extract data
+        filter_sparse_maps = filter_data["sparse_maps"]
+        filter_values = filter_data["values"]
+        feature_sparse_maps = feature_data["sparse_maps"]
+        feature_values = feature_data["values"]
+        
+        # Validate input
+        if len(filter_sparse_maps) != len(filter_values):
+            raise ValueError("Number of filter sparse maps must match number of filter value lists")
+        if len(feature_sparse_maps) != len(feature_values):
+            raise ValueError("Number of feature sparse maps must match number of feature value lists")
+        
+        # Calculate total number of rows to process
+        total_rows = len(filter_sparse_maps)
+        self.total_rows = total_rows
+        
+        # 1. Vector Analysis and Preparation
+        row_info = []
+        for i in range(total_rows):
+            # Calculate chunks needed
+            vector_length = len(filter_sparse_maps[i])
+            chunks_needed = math.ceil(vector_length / self.CHUNK_SIZE)
             
-        # Scale the input 
-        x_scaled = x / self.scale_factor
-        
-        # Clamp to int8 range
-        x_clamped = torch.clamp(x_scaled, -128, 127)
-        
-        # Quantize by rounding to nearest integer
-        x_quantized = torch.round(x_clamped)
-        
-        # Scale back
-        return x_quantized * self.scale_factor
-        
-    def forward(self, x):
-        """
-        Convert ANN activation to SNN spike train
-        
-        Args:
-            x: Input tensor with shape [batch_size, channels, height, width]
-               representing ANN activation values
-               
-        Returns:
-            spike_out: Tensor with shape [batch_size, time_steps, channels, height, width]
-                      containing spike trains
-        """
-        batch_size, channels, height, width = x.shape
-        
-        # Quantize input if needed
-        if self.quantize:
-            x = self.quantize_to_int8(x)
-        
-        # Initialize membrane potential if not exists
-        if self.membrane is None:
-            self.membrane = torch.ones_like(x) * (self.threshold / 2)
-            self.spikes = torch.zeros(batch_size, self.time_steps, channels, height, width, 
-                                     device=x.device, dtype=torch.bool)
-        
-        # Create temporal dimension by repeating input
-        # This simulates the x_buffer in Verilog
-        x_temporal = x.unsqueeze(1).repeat(1, self.time_steps, 1, 1, 1)
-        
-        # Process each timestep (similar to PROCESS state in Verilog)
-        for t in range(self.time_steps):
-            # Update membrane potential
-            self.membrane = self.membrane + x_temporal[:, t]
-            
-            # Quantize membrane potential if needed
-            if self.quantize:
-                self.membrane = self.quantize_to_int8(self.membrane)
-            
-            # Check if membrane exceeds threshold
-            spike_occurred = self.membrane >= self.threshold
-            
-            # Store spikes
-            self.spikes[:, t] = spike_occurred
-            
-            # Reset membrane potential where spikes occurred
-            self.membrane[spike_occurred] -= self.threshold
-        
-        # Convert boolean spikes to float for compatibility
-        return self.spikes.float()
-
-class SNNtoANNConverter(nn.Module):
-    """
-    Converts SNN spike trains to ANN activations
-    Corresponds to the snn_to_ann_single_neuron Verilog module
-    """
-    def __init__(self, time_steps=4):
-        """
-        Args:
-            time_steps: Number of time steps in the spike train
-        """
-        super(SNNtoANNConverter, self).__init__()
-        self.time_steps = time_steps
-        
-    def forward(self, spikes):
-        """
-        Convert SNN spike train to ANN activation by summing spikes across time
-        
-        Args:
-            spikes: Tensor with shape [batch_size, time_steps, channels, height, width]
-                   containing spike trains
-                   
-        Returns:
-            ann_out: Tensor with shape [batch_size, channels, height, width]
-                    representing ANN activation values
-        """
-        # Sum across the time dimension (axis=1)
-        # This is equivalent to the tree adder structure in Verilog
-        return torch.sum(spikes, dim=1)
-
-class SpikingNeuron(nn.Module):
-    """
-    Spiking neuron with leaky integrate-and-fire (LIF) dynamics
-    with optional 8-bit quantization
-    """
-    def __init__(self, threshold=1.0, leak_factor=0.0, quantize=False, scale_factor=1.0):
-        """
-        Args:
-            threshold: Membrane potential threshold for spiking
-            leak_factor: Membrane potential leak factor (0.0 = no leak)
-            quantize: Whether to quantize membrane potential to int8
-            scale_factor: Scale factor for quantization (membrane / scale_factor) before quantizing
-        """
-        super(SpikingNeuron, self).__init__()
-        self.threshold = threshold
-        self.leak_factor = leak_factor
-        self.quantize = quantize
-        self.scale_factor = scale_factor
-        self.reset_state()
-        
-    def reset_state(self):
-        """Reset membrane potential and spike history"""
-        self.membrane = None
-        
-    def quantize_to_int8(self, x):
-        """
-        Quantize values to int8 range (-128 to 127)
-        """
-        if not self.quantize:
-            return x
-            
-        # Scale the input (typically membrane potentials are in range [0, threshold])
-        x_scaled = x / self.scale_factor
-        
-        # Clamp to int8 range
-        x_clamped = torch.clamp(x_scaled, -128, 127)
-        
-        # Quantize by rounding to nearest integer
-        x_quantized = torch.round(x_clamped)
-        
-        # Scale back
-        return x_quantized * self.scale_factor
-        
-    def forward(self, x, output_spikes=True):
-        """
-        Forward pass for spiking neuron
-        
-        Args:
-            x: Input tensor
-            output_spikes: If True, output binary spikes; otherwise, membrane potential
-            
-        Returns:
-            Spike tensor or membrane potential tensor
-        """
-        batch_size = x.shape[0]
-        
-        # Quantize input if needed
-        if self.quantize:
-            x = self.quantize_to_int8(x)
-        
-        # Initialize membrane potential if not exists
-        if self.membrane is None:
-            self.membrane = torch.zeros_like(x)
-        
-        # Apply leak
-        if self.leak_factor > 0:
-            self.membrane = self.membrane * (1 - self.leak_factor)
-            
-        # Update membrane potential
-        self.membrane = self.membrane + x
-        
-        # Quantize membrane potential if needed
-        if self.quantize:
-            self.membrane = self.quantize_to_int8(self.membrane)
-        
-        # Generate spikes if membrane potential exceeds threshold
-        spike = (self.membrane >= self.threshold).float()
-        
-        # Reset membrane potential where spikes occurred
-        self.membrane = self.membrane - spike * self.threshold
-        
-        if output_spikes:
-            return spike
-        else:
-            return self.membrane
-
-class HybridLayer(nn.Module):
-    """
-    A hybrid layer that can be run as either ANN or SNN
-    with optional 8-bit quantization
-    """
-    def __init__(self, 
-                 layer: nn.Module,
-                 mode: str = 'ann',
-                 time_steps: int = 4,
-                 threshold: float = 1.0,
-                 leak_factor: float = 0.0,
-                 quantize: bool = False,
-                 scale_factor: float = 1.0):
-        """
-        Args:
-            layer: The PyTorch layer (Conv2d, Linear, etc.)
-            mode: 'ann' or 'snn'
-            time_steps: Number of time steps to simulate in SNN mode
-            threshold: Membrane potential threshold for spiking
-            leak_factor: Membrane potential leak factor
-            quantize: Whether to quantize to int8
-            scale_factor: Scale factor for quantization
-        """
-        super(HybridLayer, self).__init__()
-        self.layer = layer
-        self.mode = mode
-        self.time_steps = time_steps
-        self.threshold = threshold
-        self.leak_factor = leak_factor
-        self.quantize = quantize
-        self.scale_factor = scale_factor
-        
-        # Extract the base layer without activation for SNN mode
-        self.base_layer = self._extract_base_layer(layer)
-        
-        # SNN components
-        self.neuron = SpikingNeuron(threshold=threshold, leak_factor=leak_factor)
-        
-        # Converters
-        self.ann_to_snn = ANNtoSNNConverter(time_steps=time_steps, threshold=threshold)
-        self.snn_to_ann = SNNtoANNConverter(time_steps=time_steps)
-        
-    def _extract_base_layer(self, layer):
-        """
-        Extract the base layer without activation functions
-        for use in SNN mode where activations are replaced by spiking neurons
-        """
-        if isinstance(layer, nn.Sequential):
-            new_layers = []
-            for sublayer in layer:
-                if not isinstance(sublayer, nn.ReLU) and not isinstance(sublayer, nn.Dropout):
-                    new_layers.append(sublayer)
-            return nn.Sequential(*new_layers)
-        return layer
-        
-    def reset_state(self):
-        """Reset states of SNN components"""
-        self.neuron.reset_state()
-        self.ann_to_snn.reset()
-        
-    def forward(self, x, prev_mode=None, convert_output=False, target_mode=None):
-        """
-        Forward pass through the hybrid layer
-        
-        Args:
-            x: Input tensor
-            prev_mode: Mode of the previous layer ('ann' or 'snn')
-            convert_output: Whether to convert the output to the other format
-            target_mode: Target mode for the output conversion
-            
-        Returns:
-            Output tensor and its mode ('ann' or 'snn')
-        """
-        batch_size = x.shape[0]
-        
-        # Input conversion if needed
-        if prev_mode is not None and prev_mode != self.mode:
-            if self.mode == 'ann' and prev_mode == 'snn':
-                # Convert SNN input to ANN
-                x = self.snn_to_ann(x)
-            elif self.mode == 'snn' and prev_mode == 'ann':
-                # Convert ANN input to SNN
-                x = self.ann_to_snn(x)
-        
-        # Process based on mode
-        if self.mode == 'ann':
-            # Standard ANN forward pass
-            out = self.layer(x)
-            out_mode = 'ann'
-        
-        else:  # SNN mode
-            # For SNN, handle temporal dimension
-            if len(x.shape) == 4:  # [batch, channels, height, width]
-                # No temporal dimension yet, create it
-                x = x.unsqueeze(1).repeat(1, self.time_steps, 1, 1, 1)
-            
-            # Process each timestep
-            time_steps = x.shape[1]
-            spikes_out = []
-            
-            for t in range(time_steps):
-                # Get input for current timestep
-                x_t = x[:, t]
+            # Count matches in each chunk
+            total_matches = 0
+            for j in range(chunks_needed):
+                start_idx = j * self.CHUNK_SIZE
+                end_idx = min(start_idx + self.CHUNK_SIZE, vector_length)
                 
-                # Forward through the base layer WITHOUT activation functions
-                # In SNN mode, we use the base_layer (without ReLU)
-                x_t = self.base_layer(x_t)
+                # Count matches in this chunk
+                chunk_matches = sum(1 for k in range(start_idx, end_idx) 
+                                if filter_sparse_maps[i][k] and feature_sparse_maps[i][k])
+                total_matches += chunk_matches
+            
+            row_info.append({
+                "row_idx": i,
+                "chunks_needed": chunks_needed,
+                "total_matches": total_matches,
+                "vector_length": vector_length
+            })
+        
+        # Sort rows by total matches (highest first)
+        row_info.sort(key=lambda x: x["total_matches"], reverse=True)
+        
+        # Initialize simulation state
+        current_cycle = 0
+        self.total_cycles = 0
+        self.total_energy_nj = 0
+        self.total_matches = 0
+        self.total_chunks = 0
+        self.partial_sums = [0] * total_rows
+        self.pre_relu_sums = [0] * total_rows
+        self.cu_utilization = [0] * self.NUM_COMPUTE_UNITS
+        self.execution_trace = []
+        
+        # Initialize compute unit state tracking
+        cu_state = []
+        for i in range(self.NUM_COMPUTE_UNITS):
+            cu_state.append({
+                "busy_until": 0,          # When this CU will finish current task
+                "current_row": None,      # Which row is being processed
+                "current_chunk": 0,       # Which chunk is being processed
+                "total_chunks": 0,        # Total chunks for current row
+                "processing_phase": None, # "scheduling", "computing", "relu"
+                "accumulated_sum": 0,     # Running sum for current row
+                "total_active_cycles": 0  # For utilization calculation
+            })
+        
+        # Row assignment queue
+        row_queue = [info["row_idx"] for info in row_info]
+        rows_completed = 0
+        scheduler_energy = 0
+        
+        # Initialize event queue for simulation
+        # Events are (cycle, cu_idx, event_type) tuples
+        event_queue = []
+        
+        # Initial assignment of rows to compute units
+        for cu_idx in range(min(self.NUM_COMPUTE_UNITS, len(row_queue))):
+            if row_queue:
+                row_idx = row_queue.pop(0)
                 
-                # Forward through spiking neuron (this replaces ReLU in SNN mode)
-                spike = self.neuron(x_t)
-                spikes_out.append(spike)
-            
-            # Stack outputs along time dimension
-            out = torch.stack(spikes_out, dim=1)
-            out_mode = 'snn'
-            
-        # Output conversion if needed
-        if convert_output or (target_mode is not None and target_mode != out_mode):
-            if out_mode == 'ann' and (target_mode == 'snn' or target_mode is None):
-                # Convert ANN output to SNN
-                out = self.ann_to_snn(out)
-                out_mode = 'snn'
-            elif out_mode == 'snn' and (target_mode == 'ann' or target_mode is None):
-                # Convert SNN output to ANN
-                out = self.snn_to_ann(out)
-                out_mode = 'ann'
+                # Calculate row info
+                chunks_needed = math.ceil(len(filter_sparse_maps[row_idx]) / self.CHUNK_SIZE)
+                self.total_chunks += chunks_needed
                 
-        return out, out_mode
-    
-    def set_mode(self, mode):
-        """Set layer mode to 'ann' or 'snn'"""
-        assert mode in ['ann', 'snn'], "Mode must be 'ann' or 'snn'"
-        self.mode = mode
-        return self
-
-class HybridVGG16(nn.Module):
-    """
-    VGG16 network with hybrid SNN-ANN capabilities
-    with optional 8-bit quantization
-    """
-    def __init__(self, num_classes=1000, time_steps=4, threshold=1.0, init_mode='ann', 
-                 quantize=False, scale_factor=1.0):
-        """
-        Args:
-            num_classes: Number of output classes
-            time_steps: Number of time steps for SNN components
-            threshold: Membrane potential threshold for spiking
-            init_mode: Initial mode for all layers ('ann' or 'snn')
-            quantize: Whether to quantize activations to int8
-            scale_factor: Scale factor for quantization
-        """
-        super(HybridVGG16, self).__init__()
-        self.time_steps = time_steps
-        self.threshold = threshold
-        self.init_mode = init_mode
-        self.quantize = quantize
-        self.scale_factor = scale_factor
+                # Schedule first chunk (takes 1 cycle)
+                cu_state[cu_idx]["current_row"] = row_idx
+                cu_state[cu_idx]["current_chunk"] = 0
+                cu_state[cu_idx]["total_chunks"] = chunks_needed
+                cu_state[cu_idx]["processing_phase"] = "scheduling"
+                cu_state[cu_idx]["busy_until"] = current_cycle + 1  # Scheduling takes 1 cycle
+                
+                # Add event for scheduling completion
+                event_queue.append((current_cycle + 1, cu_idx, "chunk_scheduled"))
+                
+                # Track scheduler energy
+                scheduler_energy += self.SCHEDULER_POWER / self.FREQ_MHZ
+                
+                # Log event
+                self.execution_trace.append({
+                    "cycle": current_cycle,
+                    "event": f"Scheduling row {row_idx} chunk 0 to CU {cu_idx}",
+                    "details": {
+                        "total_chunks": chunks_needed
+                    }
+                })
         
-        # First layer always runs as ANN (as specified)
-        self.first_layer = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Build VGG16 architecture with hybrid layers
-        self.hybrid_layers = nn.ModuleList([
-            # Block 1 (first conv already defined above)
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(64, 64, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(64),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold,
-                quantize=quantize,
-                scale_factor=scale_factor
-            ),
+        # Main simulation loop
+        while rows_completed < total_rows:
+            # No events in queue would mean we're stuck
+            if not event_queue:
+                break
             
-            # Block 2
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(64, 128, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(128),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(128, 128, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(128),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
+            # Sort events by cycle
+            event_queue.sort(key=lambda x: x[0])
             
-            # Block 3
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(128, 256, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(256),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(256, 256, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(256),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(256, 256, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(256),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
+            # Get next event
+            next_cycle, cu_idx, event_type = event_queue.pop(0)
             
-            # Block 4
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(256, 512, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(512),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(512, 512, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(512),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(512, 512, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(512),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
+            # Advance simulation time
+            current_cycle = next_cycle
             
-            # Block 5
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(512, 512, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(512),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(512, 512, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(512),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Conv2d(512, 512, kernel_size=3, padding=1),
-                    nn.BatchNorm2d(512),
-                    nn.ReLU(inplace=True)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            
-            # Fully connected layers
-            HybridLayer(
-                nn.Sequential(
-                    nn.Linear(512 * 7 * 7, 4096),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout()
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Linear(4096, 4096),
-                    nn.ReLU(inplace=True),
-                    nn.Dropout()
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            ),
-            HybridLayer(
-                nn.Sequential(
-                    nn.Linear(4096, num_classes)
-                ),
-                mode=init_mode,
-                time_steps=time_steps,
-                threshold=threshold
-            )
-        ])
-        
-        # Pooling layers (not hybrid, applied after specific hybrid layers)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)  # After layer 1
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)  # After layer 3
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)  # After layer 6
-        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)  # After layer 9
-        self.pool5 = nn.MaxPool2d(kernel_size=2, stride=2)  # After layer 12
-        
-        # Converters for handling mode transitions
-        self.ann_to_snn = ANNtoSNNConverter(time_steps=time_steps, threshold=threshold,
-                                          quantize=quantize, scale_factor=scale_factor)
-        self.snn_to_ann = SNNtoANNConverter(time_steps=time_steps)
-        
-        # Layer mode configuration
-        self.layer_modes = [init_mode] * len(self.hybrid_layers)
-        
-    def reset_states(self):
-        """Reset states of all SNN components"""
-        for layer in self.hybrid_layers:
-            layer.reset_state()
-            
-    def set_layer_mode(self, layer_idx, mode):
-        """
-        Set mode for a specific layer
-        
-        Args:
-            layer_idx: Index of the layer to configure
-            mode: 'ann' or 'snn'
-        """
-        assert 0 <= layer_idx < len(self.hybrid_layers), f"Layer index out of range: {layer_idx}"
-        assert mode in ['ann', 'snn'], "Mode must be 'ann' or 'snn'"
-        
-        self.hybrid_layers[layer_idx].set_mode(mode)
-        self.layer_modes[layer_idx] = mode
-        
-    def set_all_modes(self, mode):
-        """Set all layers to the same mode"""
-        for i in range(len(self.hybrid_layers)):
-            self.set_layer_mode(i, mode)
-            
-    def forward(self, x):
-        """
-        Forward pass through the network
-        
-        Args:
-            x: Input image tensor [batch_size, channels, height, width]
-            
-        Returns:
-            Model output tensor
-        """
-        batch_size = x.shape[0]
-        
-        # First layer is always ANN
-        x = self.first_layer(x)
-        current_mode = 'ann'
-        
-        # Process through all hybrid layers with pooling at appropriate positions
-        for i, layer in enumerate(self.hybrid_layers):
-            # Apply pooling at specific positions
-            if i == 1:  # After first block
-                if current_mode == 'ann':
-                    x = self.pool1(x)
-                else:  # SNN mode
-                    x = torch.stack([self.pool1(x[:, t]) for t in range(x.shape[1])], dim=1)
-            elif i == 3:  # After second block
-                if current_mode == 'ann':
-                    x = self.pool2(x)
-                else:  # SNN mode
-                    x = torch.stack([self.pool2(x[:, t]) for t in range(x.shape[1])], dim=1)
-            elif i == 6:  # After third block
-                if current_mode == 'ann':
-                    x = self.pool3(x)
-                else:  # SNN mode
-                    x = torch.stack([self.pool3(x[:, t]) for t in range(x.shape[1])], dim=1)
-            elif i == 9:  # After fourth block
-                if current_mode == 'ann':
-                    x = self.pool4(x)
-                else:  # SNN mode
-                    x = torch.stack([self.pool4(x[:, t]) for t in range(x.shape[1])], dim=1)
-            elif i == 12:  # After fifth block
-                if current_mode == 'ann':
-                    x = self.pool5(x)
-                    # Flatten for FC layers
-                    x = torch.flatten(x, 1)
-                else:  # SNN mode
-                    x = torch.stack([self.pool5(x[:, t]) for t in range(x.shape[1])], dim=1)
-                    # Flatten for FC layers, preserving batch and time dimensions
-                    x = x.view(batch_size, x.shape[1], -1)
-            
-            # Forward through the hybrid layer
-            x, current_mode = layer(x, prev_mode=current_mode)
-            
-        return x
-
-def convert_ann_to_snn(ann_model, target_model=None, time_steps=4, threshold=1.0):
-    """
-    Convert a pre-trained ANN model to SNN
-    
-    Args:
-        ann_model: Pre-trained ANN model
-        target_model: Target SNN model structure (optional)
-        time_steps: Number of time steps for SNN
-        threshold: Neuron threshold for SNN
-        
-    Returns:
-        Converted SNN model
-    """
-    if target_model is None:
-        # Create a new hybrid VGG16 with all layers in SNN mode
-        target_model = HybridVGG16(
-            num_classes=1000,
-            time_steps=time_steps,
-            threshold=threshold,
-            init_mode='snn'
-        )
-    
-    # Copy weights from ANN model to corresponding layers in target model
-    # This assumes similar structures between the models
-    with torch.no_grad():
-        # Copy first layer (always ANN)
-        target_model.first_layer[0].weight.copy_(ann_model.features[0].weight)
-        target_model.first_layer[0].bias.copy_(ann_model.features[0].bias)
-        
-        # Copy hybrid layers
-        feature_layer_idx = 2  # Start after first layer
-        hybrid_layer_idx = 0
-        
-        while feature_layer_idx < len(ann_model.features):
-            # Skip non-conv layers (BatchNorm, ReLU, MaxPool)
-            if isinstance(ann_model.features[feature_layer_idx], nn.Conv2d):
-                # Copy weights to corresponding hybrid layer
-                target_model.hybrid_layers[hybrid_layer_idx].layer[0].weight.copy_(
-                    ann_model.features[feature_layer_idx].weight
-                )
-                target_model.hybrid_layers[hybrid_layer_idx].layer[0].bias.copy_(
-                    ann_model.features[feature_layer_idx].bias
-                )
-                hybrid_layer_idx += 1
-            
-            feature_layer_idx += 1
-        
-        # Copy classifier layers
-        classifier_layer_idx = 0
-        
-        for i in range(hybrid_layer_idx, len(target_model.hybrid_layers)):
-            if classifier_layer_idx < len(ann_model.classifier):
-                if isinstance(ann_model.classifier[classifier_layer_idx], nn.Linear):
-                    target_model.hybrid_layers[i].layer[0].weight.copy_(
-                        ann_model.classifier[classifier_layer_idx].weight
-                    )
-                    target_model.hybrid_layers[i].layer[0].bias.copy_(
-                        ann_model.classifier[classifier_layer_idx].bias
-                    )
-                classifier_layer_idx += 1
-    
-    return target_model
-
-# Example usage
-def load_pretrained_weights(hybrid_model, pretrained_model):
-    """
-    Load weights from a pretrained VGG16 model into the hybrid model
-    
-    Args:
-        hybrid_model: HybridVGG16 model to load weights into
-        pretrained_model: Pretrained torchvision VGG16 model
-        
-    Returns:
-        hybrid_model with loaded weights
-    """
-    print("Loading pretrained weights...")
-    
-    # Transfer first layer weights (always ANN)
-    hybrid_model.first_layer[0].weight.data.copy_(pretrained_model.features[0].weight.data)
-    hybrid_model.first_layer[0].bias.data.copy_(pretrained_model.features[0].bias.data)
-    
-    # Handle BatchNorm layers if present in first layer
-    if len(hybrid_model.first_layer) > 1 and isinstance(hybrid_model.first_layer[1], nn.BatchNorm2d):
-        if isinstance(pretrained_model.features[1], nn.BatchNorm2d):
-            hybrid_model.first_layer[1].weight.data.copy_(pretrained_model.features[1].weight.data)
-            hybrid_model.first_layer[1].bias.data.copy_(pretrained_model.features[1].bias.data)
-            hybrid_model.first_layer[1].running_mean.copy_(pretrained_model.features[1].running_mean)
-            hybrid_model.first_layer[1].running_var.copy_(pretrained_model.features[1].running_var)
-    
-    # Mapping from pretrained feature layers to hybrid layers
-    feature_idx = 2  # Start after first layer (conv+bn)
-    hybrid_idx = 0
-    
-    # Transfer weights for convolutional layers
-    while feature_idx < len(pretrained_model.features) and hybrid_idx < len(hybrid_model.hybrid_layers):
-        if isinstance(pretrained_model.features[feature_idx], nn.Conv2d):
-            # For each Conv layer, transfer weights to the corresponding hybrid layer
-            # Find the conv layer within the hybrid layer
-            conv_layer = None
-            if isinstance(hybrid_model.hybrid_layers[hybrid_idx].layer, nn.Sequential):
-                for sublayer in hybrid_model.hybrid_layers[hybrid_idx].layer:
-                    if isinstance(sublayer, nn.Conv2d):
-                        conv_layer = sublayer
-                        break
-            elif isinstance(hybrid_model.hybrid_layers[hybrid_idx].layer, nn.Conv2d):
-                conv_layer = hybrid_model.hybrid_layers[hybrid_idx].layer
-            
-            # Also check the base_layer (used in SNN mode)
-            if conv_layer is None and isinstance(hybrid_model.hybrid_layers[hybrid_idx].base_layer, nn.Sequential):
-                for sublayer in hybrid_model.hybrid_layers[hybrid_idx].base_layer:
-                    if isinstance(sublayer, nn.Conv2d):
-                        conv_layer = sublayer
-                        break
-            elif conv_layer is None and isinstance(hybrid_model.hybrid_layers[hybrid_idx].base_layer, nn.Conv2d):
-                conv_layer = hybrid_model.hybrid_layers[hybrid_idx].base_layer
+            # Process the event
+            if event_type == "chunk_scheduled":
+                # Chunk has been scheduled, start computation
+                row_idx = cu_state[cu_idx]["current_row"]
+                chunk_idx = cu_state[cu_idx]["current_chunk"]
+                
+                # Calculate start and end indices for this chunk
+                vector_length = len(filter_sparse_maps[row_idx])
+                start_idx = chunk_idx * self.CHUNK_SIZE
+                end_idx = min(start_idx + self.CHUNK_SIZE, vector_length)
+                
+                # Create chunk-specific data
+                chunk_filter_map = filter_sparse_maps[row_idx][start_idx:end_idx]
+                chunk_feature_map = feature_sparse_maps[row_idx][start_idx:end_idx]
+                
+                # Count matches in this chunk
+                matches = sum(1 for k in range(len(chunk_filter_map)) 
+                            if chunk_filter_map[k] and chunk_feature_map[k])
+                
+                # Calculate computation time: 4 + (matches - 1)
+                compute_cycles = 4 + max(0, matches - 1) if matches > 0 else 1
+                
+                # Update state
+                cu_state[cu_idx]["processing_phase"] = "computing"
+                cu_state[cu_idx]["busy_until"] = current_cycle + compute_cycles
+                
+                # Track active cycles
+                cu_state[cu_idx]["total_active_cycles"] += compute_cycles
+                
+                # Schedule completion event
+                event_queue.append((current_cycle + compute_cycles, cu_idx, "chunk_computed"))
+                
+                # Compute energy and update metrics
+                chip_energy = 11.010 * matches * 1/560  # We would calculate this based on component activity
+                self.total_energy_nj += chip_energy
+                self.total_matches += matches
+                
+                # Log event
+                self.execution_trace.append({
+                    "cycle": current_cycle,
+                    "event": f"CU {cu_idx} computing row {row_idx} chunk {chunk_idx}",
+                    "details": {
+                        "matches": matches,
+                        "compute_cycles": compute_cycles,
+                        "completion_cycle": current_cycle + compute_cycles
+                    }
+                })
+                
+            elif event_type == "chunk_computed":
+                # Chunk computation complete
+                row_idx = cu_state[cu_idx]["current_row"]
+                chunk_idx = cu_state[cu_idx]["current_chunk"]
+                
+                # Calculate chunk contribution to sum
+                # (In a real simulation, this would come from the simulator)
+                vector_length = len(filter_sparse_maps[row_idx])
+                start_idx = chunk_idx * self.CHUNK_SIZE
+                end_idx = min(start_idx + self.CHUNK_SIZE, vector_length)
+                
+                # Extract values based on filter and feature maps
+                chunk_filter_map = filter_sparse_maps[row_idx][start_idx:end_idx]
+                chunk_feature_map = feature_sparse_maps[row_idx][start_idx:end_idx]
+                
+                # Find matches
+                matches = []
+                for i in range(len(chunk_filter_map)):
+                    if chunk_filter_map[i] and chunk_feature_map[i]:
+                        # Find position in original sparse maps
+                        filter_pos = sum(1 for j in range(start_idx + i) if filter_sparse_maps[row_idx][j])
+                        feature_pos = sum(1 for j in range(start_idx + i) if feature_sparse_maps[row_idx][j])
                         
-            if conv_layer is not None:
-                # Copy weights and bias
-                conv_layer.weight.data.copy_(pretrained_model.features[feature_idx].weight.data)
-                conv_layer.bias.data.copy_(pretrained_model.features[feature_idx].bias.data)
-                print(f"Transferred weights for convolutional layer {feature_idx} to hybrid layer {hybrid_idx}")
-            
-            # Handle BatchNorm if present in pretrained model
-            if (feature_idx + 1 < len(pretrained_model.features) and 
-                isinstance(pretrained_model.features[feature_idx + 1], nn.BatchNorm2d)):
+                        if filter_pos <= len(filter_values[row_idx]) and feature_pos <= len(feature_values[row_idx]):
+                            filter_val = filter_values[row_idx][filter_pos-1]
+                            feature_val = feature_values[row_idx][feature_pos-1]
+                            matches.append(filter_val * feature_val)
                 
-                # Find the BatchNorm layer in the hybrid layer
-                bn_layer = None
-                if isinstance(hybrid_model.hybrid_layers[hybrid_idx].layer, nn.Sequential):
-                    for sublayer in hybrid_model.hybrid_layers[hybrid_idx].layer:
-                        if isinstance(sublayer, nn.BatchNorm2d):
-                            bn_layer = sublayer
-                            break
+                # Update accumulated sum
+                chunk_sum = sum(matches)
+                cu_state[cu_idx]["accumulated_sum"] += chunk_sum
                 
-                # Also check the base_layer
-                if bn_layer is None and isinstance(hybrid_model.hybrid_layers[hybrid_idx].base_layer, nn.Sequential):
-                    for sublayer in hybrid_model.hybrid_layers[hybrid_idx].base_layer:
-                        if isinstance(sublayer, nn.BatchNorm2d):
-                            bn_layer = sublayer
-                            break
-                
-                if bn_layer is not None:
-                    bn_layer.weight.data.copy_(pretrained_model.features[feature_idx + 1].weight.data)
-                    bn_layer.bias.data.copy_(pretrained_model.features[feature_idx + 1].bias.data)
-                    bn_layer.running_mean.copy_(pretrained_model.features[feature_idx + 1].running_mean)
-                    bn_layer.running_var.copy_(pretrained_model.features[feature_idx + 1].running_var)
-                    print(f"Transferred BatchNorm parameters for layer {feature_idx+1}")
-                        
-            hybrid_idx += 1
-        
-        feature_idx += 1
-    
-    # Transfer weights for classifier layers (fully connected layers)
-    classifier_indices = [i for i, layer in enumerate(pretrained_model.classifier) 
-                         if isinstance(layer, nn.Linear)]
-    
-    fc_layers_start = hybrid_idx  # First FC layer index in hybrid_layers
-    
-    # Map classifier layers to the remaining hybrid layers
-    for i, cls_idx in enumerate(classifier_indices):
-        if fc_layers_start + i >= len(hybrid_model.hybrid_layers):
-            break
-            
-        # Find the Linear layer in the hybrid layer
-        linear_layer = None
-        if isinstance(hybrid_model.hybrid_layers[fc_layers_start + i].layer, nn.Sequential):
-            for sublayer in hybrid_model.hybrid_layers[fc_layers_start + i].layer:
-                if isinstance(sublayer, nn.Linear):
-                    linear_layer = sublayer
-                    break
-        elif isinstance(hybrid_model.hybrid_layers[fc_layers_start + i].layer, nn.Linear):
-            linear_layer = hybrid_model.hybrid_layers[fc_layers_start + i].layer
-        
-        # Also check the base_layer
-        if linear_layer is None and isinstance(hybrid_model.hybrid_layers[fc_layers_start + i].base_layer, nn.Sequential):
-            for sublayer in hybrid_model.hybrid_layers[fc_layers_start + i].base_layer:
-                if isinstance(sublayer, nn.Linear):
-                    linear_layer = sublayer
-                    break
-        elif linear_layer is None and isinstance(hybrid_model.hybrid_layers[fc_layers_start + i].base_layer, nn.Linear):
-            linear_layer = hybrid_model.hybrid_layers[fc_layers_start + i].base_layer
+                # Check if more chunks remain
+                if chunk_idx + 1 < cu_state[cu_idx]["total_chunks"]:
+                    # Schedule next chunk (takes 1 cycle)
+                    cu_state[cu_idx]["current_chunk"] += 1
+                    cu_state[cu_idx]["processing_phase"] = "scheduling"
+                    cu_state[cu_idx]["busy_until"] = current_cycle + 1
                     
-        if linear_layer is not None:
-            # Copy weights and bias
-            linear_layer.weight.data.copy_(pretrained_model.classifier[cls_idx].weight.data)
-            linear_layer.bias.data.copy_(pretrained_model.classifier[cls_idx].bias.data)
-            print(f"Transferred weights for fully connected layer {cls_idx} to hybrid layer {fc_layers_start + i}")
+                    # Add event for scheduling completion
+                    event_queue.append((current_cycle + 1, cu_idx, "chunk_scheduled"))
+                    
+                    # Track scheduler energy
+                    scheduler_energy += self.SCHEDULER_POWER / self.FREQ_MHZ
+                    
+                    # Log event
+                    self.execution_trace.append({
+                        "cycle": current_cycle,
+                        "event": f"Scheduling row {row_idx} chunk {chunk_idx+1} to CU {cu_idx}",
+                        "details": {
+                            "accumulated_sum": cu_state[cu_idx]["accumulated_sum"]
+                        }
+                    })
+                else:
+                    # All chunks processed, schedule ReLU (takes 1 cycle)
+                    cu_state[cu_idx]["processing_phase"] = "relu"
+                    cu_state[cu_idx]["busy_until"] = current_cycle + 1
+                    
+                    # Add event for ReLU completion
+                    event_queue.append((current_cycle + 1, cu_idx, "relu_completed"))
+                    
+                    # Log event
+                    self.execution_trace.append({
+                        "cycle": current_cycle,
+                        "event": f"CU {cu_idx} performing ReLU for row {row_idx}",
+                        "details": {
+                            "pre_relu_sum": cu_state[cu_idx]["accumulated_sum"]
+                        }
+                    })
+            
+            elif event_type == "relu_completed":
+                # ReLU computation complete
+                row_idx = cu_state[cu_idx]["current_row"]
+                
+                # Apply ReLU function
+                pre_relu_sum = cu_state[cu_idx]["accumulated_sum"]
+                post_relu_sum = max(0, pre_relu_sum)
+                
+                # Store results
+                self.pre_relu_sums[row_idx] = pre_relu_sum
+                self.partial_sums[row_idx] = post_relu_sum
+                
+                # Mark row as completed
+                rows_completed += 1
+                
+                # Log event
+                self.execution_trace.append({
+                    "cycle": current_cycle,
+                    "event": f"CU {cu_idx} completed row {row_idx}",
+                    "details": {
+                        "pre_relu_sum": pre_relu_sum,
+                        "post_relu_sum": post_relu_sum
+                    }
+                })
+                
+                # Check if more rows are available
+                if row_queue:
+                    # Schedule next row (takes 1 cycle)
+                    new_row_idx = row_queue.pop(0)
+                    
+                    # Reset compute unit state for new row
+                    chunks_needed = math.ceil(len(filter_sparse_maps[new_row_idx]) / self.CHUNK_SIZE)
+                    self.total_chunks += chunks_needed
+                    
+                    cu_state[cu_idx]["current_row"] = new_row_idx
+                    cu_state[cu_idx]["current_chunk"] = 0
+                    cu_state[cu_idx]["total_chunks"] = chunks_needed
+                    cu_state[cu_idx]["processing_phase"] = "scheduling"
+                    cu_state[cu_idx]["busy_until"] = current_cycle + 1
+                    cu_state[cu_idx]["accumulated_sum"] = 0
+                    
+                    # Add event for scheduling completion
+                    event_queue.append((current_cycle + 1, cu_idx, "chunk_scheduled"))
+                    
+                    # Track scheduler energy
+                    scheduler_energy += self.SCHEDULER_POWER / self.FREQ_MHZ
+                    
+                    # Log event
+                    self.execution_trace.append({
+                        "cycle": current_cycle,
+                        "event": f"Scheduling row {new_row_idx} chunk 0 to CU {cu_idx}",
+                        "details": {
+                            "total_chunks": chunks_needed
+                        }
+                    })
+                else:
+                    # No more rows, mark compute unit as idle
+                    cu_state[cu_idx]["current_row"] = None
+                    cu_state[cu_idx]["processing_phase"] = None
+        
+        # Update final metrics
+        self.total_cycles = current_cycle
+        self.energy_breakdown["scheduler"] = scheduler_energy
+        self.energy_breakdown["compute_units"] = self.total_energy_nj
+        self.total_energy_nj += scheduler_energy
+        
+        # Calculate compute unit utilization
+        for cu_idx in range(self.NUM_COMPUTE_UNITS):
+            self.cu_utilization[cu_idx] = cu_state[cu_idx]["total_active_cycles"] / max(1, self.total_cycles)
+        
+        # Return a report of the simulation results
+        return self.generate_report()
     
-    print("Weight transfer complete!")
-    return hybrid_model
+    def generate_report(self):
+        """Generate a report of the simulation results"""
+        report = {
+            "total_cycles": self.total_cycles,
+            "total_energy_nj": self.total_energy_nj,
+            "energy_per_operation_nj": self.total_energy_nj / max(1, self.total_matches),
+            "total_matches": self.total_matches,
+            "total_chunks": self.total_chunks,
+            "total_rows": self.total_rows,
+            "rows_per_cycle": self.total_rows / max(1, self.total_cycles),
+            "operations_per_cycle": self.total_matches / max(1, self.total_cycles),
+            "partial_sums": self.partial_sums,
+            "pre_relu" : self.pre_relu_sums,
+            "cu_utilization": self.cu_utilization,
+            "average_utilization": sum(self.cu_utilization) / max(1, len(self.cu_utilization)),
+            "energy_breakdown": self.energy_breakdown,
+            "execution_trace": self.execution_trace
+        }
+        return report
+    
+    def print_summary(self, report=None):
+        """Print a summary of the simulation results"""
+        if report is None:
+            report = self.generate_report()
+        
+        print("\n=== SparTen Cluster Dynamic Simulation Summary ===")
+        print(f"Total rows processed: {report['total_rows']}")
+        print(f"Total chunks processed: {report['total_chunks']}")
+        print(f"Total matches found: {report['total_matches']}")
+        print(f"Total cycles: {report['total_cycles']}")
+        print(f"Rows per cycle: {report['rows_per_cycle']:.2f}")
+        print(f"Operations per cycle: {report['operations_per_cycle']:.2f}")
+        print(f"Average compute unit utilization: {report['average_utilization']*100:.1f}%")
+        
+        # Print individual compute unit utilization
+        print("\nCompute unit utilization:")
+        for i, util in enumerate(report['cu_utilization']):
+            print(f"  CU {i}: {util*100:.1f}%")
+        
+        # Print individual partial sums
+        print("\nPartial sums for each row:")
+        for i, partial_sum in enumerate(report['partial_sums']):
+            print(f"  Row {i}: {partial_sum}")
+        
+        # Print summary statistics for partial sums
+        # sums = report['partial_sums']
+        # if sums:
+        #     print(f"\nPartial sums summary statistics:")
+        #     print(f"  Average: {sum(sums)/len(sums):.2f}")
+        #     print(f"  Minimum: {min(sums)}")
+        #     print(f"  Maximum: {max(sums)}")
+        #     print(f"  Total: {sum(sums)}")
+        
+        print(f"\nTotal energy consumption: {report['total_energy_nj']:.2f} nJ")
+        print(f"Energy per operation: {report['energy_per_operation_nj']:.2f} nJ")
+        
+        # Scheduler vs. compute units energy
+        scheduler_energy = report['energy_breakdown']['scheduler']
+        compute_energy = report['energy_breakdown']['compute_units']
+        
+        print("\nEnergy breakdown:")
+        print(f"  Scheduler: {scheduler_energy:.2f} nJ ({scheduler_energy/report['total_energy_nj']*100:.1f}%)")
+        print(f"  Compute Units: {compute_energy:.2f} nJ ({compute_energy/report['total_energy_nj']*100:.1f}%)")
+        print("================================================\n")
+    
+    def visualize_execution(self, report=None):
+        """Visualize the execution timeline with proper scheduling cycles and phases"""
+        if report is None:
+            report = self.generate_report()
+        
+        trace = report['execution_trace']
+        if not trace:
+            print("No execution trace available for visualization.")
+            return
+        
+        # Extract event information and track state changes
+        cu_activity = {}
+        for event in trace:
+            cycle = event['cycle']
+            event_desc = event['event']
+            
+            # Parse events to determine CU activities
+            if "Scheduling row" in event_desc:
+                # Extract row, chunk, and CU info
+                parts = event_desc.split()
+                row_idx = int(parts[2])
+                cu_idx = int(parts[-1])
+                
+                # Determine if this is first chunk or subsequent chunk
+                if "chunk 0" in event_desc:
+                    # New row assignment
+                    if cu_idx not in cu_activity:
+                        cu_activity[cu_idx] = []
+                    
+                    cu_activity[cu_idx].append({
+                        'row': row_idx,
+                        'phase': 'scheduling',
+                        'start': cycle,
+                        'end': cycle + 1,  # Scheduling takes 1 cycle
+                        'color': 'lightgrey'
+                    })
+                else:
+                    # Inter-chunk scheduling
+                    cu_activity[cu_idx].append({
+                        'row': row_idx,
+                        'phase': 'scheduling',
+                        'start': cycle,
+                        'end': cycle + 1,  # Scheduling takes 1 cycle
+                        'color': 'lightgrey'
+                    })
+            
+            elif "computing row" in event_desc:
+                # Extract row, chunk, and CU info
+                parts = event_desc.split()
+                cu_idx = int(parts[1])
+                row_idx = int(parts[4])
+                chunk_idx = int(parts[6])
+                
+                # Get computation end time
+                completion_cycle = event['details']['completion_cycle']
+                
+                cu_activity[cu_idx].append({
+                    'row': row_idx,
+                    'phase': 'computing',
+                    'chunk': chunk_idx,
+                    'start': cycle,
+                    'end': completion_cycle,
+                    'color': 'cornflowerblue',
+                    'matches': event['details']['matches'] if 'matches' in event['details'] else 0
+                })
+            
+            elif "performing ReLU" in event_desc:
+                # Extract row and CU info
+                parts = event_desc.split()
+                cu_idx = int(parts[1])
+                row_idx = int(parts[6])
+                
+                cu_activity[cu_idx].append({
+                    'row': row_idx,
+                    'phase': 'relu',
+                    'start': cycle,
+                    'end': cycle + 1,  # ReLU takes 1 cycle
+                    'color': 'firebrick'
+                })
+        
+        # Create Gantt chart visualization
+        plt.figure(figsize=(16, 10))
+        
+        # Create a colormap for rows
+        row_colors = plt.cm.viridis(np.linspace(0, 1, report['total_rows']))
+        
+        # Phase-specific colors
+        phase_colors = {
+            'scheduling': 'lightgrey',
+            'computing': 'cornflowerblue',
+            'relu': 'firebrick'
+        }
+        
+        # Plot compute unit activity
+        y_ticks = []
+        y_labels = []
+        
+        for cu_idx, activities in sorted(cu_activity.items()):
+            y_pos = cu_idx
+            y_ticks.append(y_pos)
+            y_labels.append(f"CU {cu_idx}")
+            
+            for activity in activities:
+                duration = activity['end'] - activity['start']
+                
+                # Set color based on phase
+                color = activity['color']
+                
+                # Add activity bar
+                plt.barh(y_pos, duration, left=activity['start'], color=color, 
+                        alpha=0.8, edgecolor='black')
+                
+                # Add label if bar is wide enough
+                if duration > report['total_cycles'] * 0.03:
+                    if activity['phase'] == 'computing':
+                        label = f"R{activity['row']}C{activity.get('chunk', '')}"
+                    elif activity['phase'] == 'relu':
+                        label = f"R{activity['row']}:ReLU"
+                    else:
+                        label = f"Sched"
+                    
+                    plt.text(activity['start'] + duration/2, y_pos, label, 
+                            ha='center', va='center', fontsize=8, 
+                            color='black', fontweight='bold')
+        
+        # Add legend for phases
+        legend_elements = [
+            plt.Rectangle((0,0), 1, 1, facecolor='lightgrey', edgecolor='black', alpha=0.8, label='Scheduling'),
+            plt.Rectangle((0,0), 1, 1, facecolor='cornflowerblue', edgecolor='black', alpha=0.8, label='Computing'),
+            plt.Rectangle((0,0), 1, 1, facecolor='firebrick', edgecolor='black', alpha=0.8, label='ReLU')
+        ]
+        
+        plt.legend(handles=legend_elements, loc='upper right')
+        
+        # Set chart properties
+        plt.yticks(y_ticks, y_labels)
+        plt.xlabel('Cycle')
+        plt.ylabel('Compute Unit')
+        plt.title('SparTen Cluster Execution Timeline with Scheduling Phases')
+        plt.grid(axis='x', alpha=0.3)
+        
+        # Add cycle markers at regular intervals
+        max_cycle = report['total_cycles']
+        cycle_interval = max(1, max_cycle // 20)
+        plt.xticks(range(0, max_cycle + cycle_interval, cycle_interval))
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Create utilization visualization
+        plt.figure(figsize=(12, 6))
+        
+        cu_indices = range(self.NUM_COMPUTE_UNITS)
+        utilization = report['cu_utilization']
+        
+        plt.bar(cu_indices, utilization)
+        plt.axhline(report['average_utilization'], color='r', linestyle='--', 
+                    label=f"Average: {report['average_utilization']*100:.1f}%")
+        
+        plt.xlabel('Compute Unit')
+        plt.ylabel('Utilization')
+        plt.title('Compute Unit Utilization')
+        plt.xticks(cu_indices, [f"CU {i}" for i in cu_indices])
+        plt.ylim(0, 1.1)
+        plt.grid(axis='y', alpha=0.3)
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.show()
 
-def example_with_pretrained_weights():
+# Create a simple debugging test case where different rows have very different match counts
+def create_debug_test_data():
     """
-    Example demonstrating how to load pretrained weights into the hybrid model
+    Create a test case with rows of varying complexity:
+    - Some rows with many matches (heavy rows)
+    - Some rows with few matches (light rows)
     """
-    import torchvision.models as models
+    rows = 20  # Total number of rows
+    elements = 256  # Elements per row
     
-    # Load pretrained VGG16 model
-    print("Loading pretrained VGG16 model...")
-    pretrained_vgg16 = models.vgg16(pretrained=True)
+    filter_sparse_maps = []
+    filter_values = []
+    feature_sparse_maps = []
+    feature_values = []
     
-    # Create hybrid model
-    print("Creating hybrid model...")
-    hybrid_model = HybridVGG16(
-        num_classes=1000,
-        time_steps=8,
-        init_mode='ann',
-        quantize=True,
-        scale_factor=1.0
-    )
+    # Create rows with varying density
+    for i in range(rows):
+        # Vary density based on row index
+        if i % 5 == 0:  # 20% of rows are very dense
+            density = 0.8
+        elif i % 5 == 1:  # 20% of rows are dense
+            density = 0.6
+        elif i % 5 == 2:  # 20% of rows are medium
+            density = 0.4
+        elif i % 5 == 3:  # 20% of rows are sparse
+            density = 0.2
+        else:  # 20% of rows are very sparse
+            density = 0.1
+        
+        # Create filter with this density
+        filter_map = [False] * elements
+        for j in range(elements):
+            if np.random.random() < density:
+                filter_map[j] = True
+        
+        # Create feature with same density pattern to ensure matches
+        feature_map = filter_map.copy()  # Use same pattern for debugging clarity
+        
+        # Count non-zeros
+        filter_nonzeros = sum(filter_map)
+        feature_nonzeros = sum(feature_map)
+        
+        # Create values
+        filter_row_values = [i * 10 + j for j in range(filter_nonzeros)]
+        feature_row_values = [j + 1 for j in range(feature_nonzeros)]
+        
+        # Add to lists
+        filter_sparse_maps.append(filter_map)
+        filter_values.append(filter_row_values)
+        feature_sparse_maps.append(feature_map)
+        feature_values.append(feature_row_values)
     
-    # Transfer weights
-    hybrid_model = load_pretrained_weights(hybrid_model, pretrained_vgg16)
+    return {
+        "filter_data": {
+            "sparse_maps": filter_sparse_maps,
+            "values": filter_values
+        },
+        "feature_data": {
+            "sparse_maps": feature_sparse_maps,
+            "values": feature_values
+        }
+    }
+
+def run_dynamic_cluster_test():
+    """Run a test of the SparTen dynamic cluster simulator"""
+    print("=== SparTen Dynamic Cluster Test ===")
     
-    # Configure some layers as SNN
-    hybrid_model.set_layer_mode(1, 'snn')  # Second layer to SNN
-    hybrid_model.set_layer_mode(2, 'snn')  # Third layer to SNN
+    # Create a cluster
+    cluster = SparTenClusterDynamic(num_compute_units=16)
     
-    # Reset SNN states
-    hybrid_model.reset_states()
+    # Create debug test data
+    test_data = create_debug_test_data()
     
-    print("Model ready for inference!")
-    return hybrid_model
+    filter_data = test_data["filter_data"]
+    feature_data = test_data["feature_data"]
+    
+    # Run simulation
+    report = cluster.run_simulation(filter_data, feature_data)
+    
+    # Print summary
+    cluster.print_summary(report)
+    
+    # Visualize execution
+    cluster.visualize_execution(report)
+    
+    return cluster, report
 
 if __name__ == "__main__":
-    # Example of creating and using a hybrid model with pretrained weights
-    model = example_with_pretrained_weights()
-    
-    # Example inference
-    x = torch.randn(1, 3, 224, 224)  # Example input
-    output = model(x)
-    print(f"Output shape: {output.shape}")
-    
-    # Example: Calculate model size
-    param_count = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {param_count:,}")
-    
-    # Example: Calculate quantized model size (if all parameters were quantized to int8)
-    # Each int8 value takes 1 byte
-    quantized_size_bytes = param_count
-    print(f"Quantized model size: {quantized_size_bytes/1024/1024:.2f} MB")
-    
-    # Compare with full precision model (each parameter as float32, 4 bytes)
-    full_precision_size = param_count * 4
-    print(f"Full precision model size: {full_precision_size/1024/1024:.2f} MB")
-    print(f"Size reduction: {full_precision_size/quantized_size_bytes:.2f}x")
+    cluster, report = run_dynamic_cluster_test()
